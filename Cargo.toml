@@ -2,5 +2,5 @@
 resolver = "3"
 members = [
     "server",
-    "client",
+    "client", "remote-fs-server",
 ]
