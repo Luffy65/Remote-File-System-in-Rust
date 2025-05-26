@@ -17,8 +17,8 @@ This project aims to implement a remote file system client in Rust that presents
 
 ### Core Functionality
 
-- [ ] Mount a virtual file system to a local path (e.g., /mnt/remote-fs )
-- [ ] Display directories and files from a remote source
+- [x] Mount a virtual file system to a local path (e.g., /mnt/remote-fs )
+- [x] Display directories and files from a remote source
 - [ ] Read files from the remote server
 - [ ] Write modified files back to the remote server
 - [ ] Support creation, deletion, and renaming of files and directories
@@ -66,36 +66,6 @@ Il logging (log::info!, log::debug!) è tuo amico durante lo sviluppo di un file
 ## TODO
 
 ### Phase 1: Core Setup & Basic Server Interaction
-
-#### 🎯 Sub-Goal 2: Design and Mock the Simplest Server Endpoints
-
-* **Task:** Define the exact request/response structure for the `GET /list/path` endpoint.
-    * Example response for `GET /list/` :
-        ```json
-        [
-            {"name": "Documents", "type": "directory", "size": 0, "modified_at": "2024-05-22T10:00:00Z"},
-            {"name": "image.jpg", "type": "file", "size": 102400, "modified_at": "2024-05-22T11:30:00Z"}
-        ]
-        ```
-* **Task:** Implement a very basic mock server (e.g. Rust with Axum/Actix-web) that serves static, predefined data for `GET /list/` and `GET /list/some_directory/`.
-    * This server doesn't need to manage actual files yet, just respond correctly to the defined API for listing.
-    * Example:
-        * `GET /list/` returns a predefined list of items.
-        * `GET /list/folder1/` returns another predefined list.
-
----
-
-#### 🎯 Sub-Goal 3: Implement Client-Side Directory Listing
-
-* **Task:** In the Rust FUSE client, implement the `readdir` FUSE operation.
-* **Task:** This `readdir` implementation should:
-    1.  Receive a path from the FUSE kernel.
-    2.  Make an HTTP GET request to the mock server's `GET /list/path_from_fuse` endpoint.
-    3.  Parse the JSON response from the server.
-    4.  Translate the server's response into the format expected by `fuser`'s `reply.entry()` or `reply.add()`.
-* **Goal:** Be able to `ls /mnt/remote-fs` and see the directory contents served by your mock server.
-
----
 
 #### 🎯 Sub-Goal 4: Basic File Read (Read-Only)
 
