@@ -108,9 +108,7 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Mock server listening on {}", addr);
 
-    // Start the Axum server.
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    // Start the Axum server using the new API.
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
