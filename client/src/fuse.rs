@@ -73,6 +73,24 @@ impl Filesystem for RemoteFs {
         Ok(())
     }
 
+    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        debug!("open(ino={})", ino);
+
+        // Verify the inode exists and is a file
+        let inode_map = self.inode_map.lock().unwrap();
+        if let Some(attr) = inode_map.get(&ino) {
+            if attr.kind == FileType::RegularFile {
+                // Success! 0 for file handle (we aren't tracking handles yet), 0 for flags
+                reply.opened(0, 0);
+            } else {
+                // It's a directory or something else
+                reply.error(libc::EISDIR);
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
     fn destroy(&mut self) {
         info!("Filesystem destroyed.");
     }
@@ -87,35 +105,82 @@ impl Filesystem for RemoteFs {
         };
         debug!("lookup(parent_ino={}, name='{}')", parent_ino, name_str);
 
-        let path_to_inode_map = self.path_to_inode.lock().unwrap();
-        let inode_map = self.inode_map.lock().unwrap();
-
-        let parent_path_str = path_to_inode_map.iter()
-            .find_map(|(path, &inode)| if inode == parent_ino { Some(path.clone()) } else { None })
-            .unwrap_or_else(|| {
-                warn!("Parent path for ino {} not found, defaulting to root for lookup.", parent_ino);
-                "/".to_string()
-            });
+        // 1. Determine the parent path
+        let parent_path_str = {
+            let path_to_inode_map = self.path_to_inode.lock().unwrap();
+            path_to_inode_map.iter()
+                .find_map(|(path, &inode)| if inode == parent_ino { Some(path.clone()) } else { None })
+                .unwrap_or_else(|| {
+                    warn!("Parent path for ino {} not found, defaulting to root.", parent_ino);
+                    "/".to_string()
+                })
+        };
 
         let full_path = if parent_path_str == "/" {
             format!("/{}", name_str)
         } else {
             format!("{}/{}", parent_path_str.trim_end_matches('/'), name_str)
         };
-        
+
         debug!("Looking up full path: {}", full_path);
 
-        if let Some(&ino) = path_to_inode_map.get(&full_path) {
-            if let Some(attr) = inode_map.get(&ino) {
-                debug!("Found attr for path {}: {:?}", full_path, attr);
-                reply.entry(&TTL, attr, 0); // 0 generation
-            } else {
-                error!("Inode {} for path {} found in path_to_inode but not in inode_map!", ino, full_path);
+        // 2. Check the Local Cache First
+        {
+            let path_to_inode_map = self.path_to_inode.lock().unwrap();
+            let inode_map = self.inode_map.lock().unwrap();
+
+            if let Some(&ino) = path_to_inode_map.get(&full_path) {
+                if let Some(attr) = inode_map.get(&ino) {
+                    debug!("CACHE HIT: Found attr for path {}: {:?}", full_path, attr);
+                    reply.entry(&TTL, attr, 0);
+                    return; // We are done!
+                }
+            }
+        } // The Mutex locks are safely dropped here!
+
+        // 3. Cache Miss: Ask the server about the parent directory
+        debug!("CACHE MISS: Fetching parent directory '{}' from server...", parent_path_str);
+
+        let api_path = if parent_path_str == "/" {
+            "".to_string()
+        } else {
+            parent_path_str.trim_start_matches('/').to_string()
+        };
+
+        match self.runtime.block_on(api::list_directory(&self.server_addr, &api_path)) {
+            Ok(api_entries) => {
+                // Look for the specific file the OS asked for in the server's response
+                if let Some(api_entry) = api_entries.into_iter().find(|e| e.name == name_str) {
+
+                    // We found it! Generate a new inode and cache it.
+                    let mut inode_map_locked = self.inode_map.lock().unwrap();
+                    let mut path_to_inode_locked = self.path_to_inode.lock().unwrap();
+                    let mut next_inode_locked = self.next_inode.lock().unwrap();
+
+                    let new_ino = *next_inode_locked;
+                    *next_inode_locked += 1;
+
+                    let kind = if api_entry.type_ == "directory" { FileType::Directory } else { FileType::RegularFile };
+                    let perm = if kind == FileType::Directory { 0o755 } else { 0o644 };
+
+                    // Reusing your helper function
+                    let attr = create_file_attr(new_ino, kind, api_entry.size, perm);
+
+                    inode_map_locked.insert(new_ino, attr);
+                    path_to_inode_locked.insert(full_path.clone(), new_ino);
+
+                    debug!("Dynamically added new entry to cache: ino={}, path='{}'", new_ino, full_path);
+                    reply.entry(&TTL, &attr, 0);
+
+                } else {
+                    debug!("Path {} genuinely does not exist on the server.", full_path);
+                    reply.error(ENOENT);
+                }
+            }
+            Err(err) => {
+                error!("Network error during lookup of {}: {:?}", full_path, err);
                 reply.error(ENOENT);
             }
-        } else {
-            debug!("Path {} not found in path_to_inode map.", full_path);
-            reply.error(ENOENT);
         }
     }
 
@@ -136,16 +201,53 @@ impl Filesystem for RemoteFs {
     fn read(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
-        _offset: i64,
-        _size: u32,
+        offset: i64,
+        size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!("read called for ino {}. Currently not implemented beyond dummy files.", _ino);
-        reply.error(ENOENT);
+        debug!("read(ino={}, offset={}, size={})", ino, offset, size);
+
+        // 1. Find the path associated with this inode
+        let path = {
+            let path_map = self.path_to_inode.lock().unwrap();
+            path_map.iter()
+                .find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
+        };
+        let file_path = match path {
+            Some(p) => p,
+            None => {
+                error!("read: Could not find path for ino {}", ino);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        // Clean up the path for the API (remove leading slash)
+        let api_path = file_path.trim_start_matches('/');
+
+        // 2. Fetch the file content from the server
+        match self.runtime.block_on(api::read_file(&self.server_addr, api_path)) {
+            Ok(bytes) => {
+                // 3. Slice the data based on offset and size requested by the kernel
+                let start = offset as usize;
+                let end = std::cmp::min(start + size as usize, bytes.len());
+
+                if start >= bytes.len() {
+                    // EOF reached
+                    reply.data(&[]);
+                } else {
+                    // Return the requested chunk
+                    reply.data(&bytes[start..end]);
+                }
+            }
+            Err(err) => {
+                error!("Failed to read file {} from server: {:?}", api_path, err);
+                reply.error(libc::EIO); // I/O Error
+            }
+        }
     }
 
     fn readdir(

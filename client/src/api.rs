@@ -40,3 +40,22 @@ pub async fn list_directory(
         reqwest::get("http://invalid-non-existent-server-domain-12345").await.map(|_| vec![]).map_err(|e| e)
     }
 }
+
+pub async fn read_file(base_url: &str, path: &str) -> Result<Vec<u8>, reqwest::Error> {
+    // Normalize paths
+    let normalized_base_url = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+
+    // Construct the endpoint for file reading
+    let request_url = format!("{}/files/{}", normalized_base_url, normalized_path);
+
+    log::debug!("Requesting file content from URL: {}", request_url);
+
+    // Fetch the response and automatically convert HTTP errors (like 404) into reqwest::Error
+    let response = reqwest::get(&request_url).await?.error_for_status()?;
+
+    // Read the body as bytes
+    let bytes = response.bytes().await?;
+
+    Ok(bytes.to_vec())
+}
