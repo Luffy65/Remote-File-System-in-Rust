@@ -73,6 +73,71 @@ impl Filesystem for RemoteFs {
         Ok(())
     }
 
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name_str = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                reply.error(libc::EINVAL); // Invalid argument
+                return;
+            }
+        };
+        debug!("mkdir(parent={}, name='{}', mode={:o})", parent, name_str, mode);
+
+        // 1. Find the parent directory's path
+        let parent_path_str = {
+            let path_to_inode_map = self.path_to_inode.lock().unwrap();
+            path_to_inode_map.iter()
+                .find_map(|(path, &inode)| if inode == parent { Some(path.clone()) } else { None })
+                .unwrap_or_else(|| "/".to_string())
+        };
+
+        // 2. Construct the full path of the NEW directory
+        let full_path = if parent_path_str == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path_str.trim_end_matches('/'), name_str)
+        };
+
+        let api_path = full_path.trim_start_matches('/');
+
+        // 3. Tell the remote server to create it
+        match self.runtime.block_on(api::create_directory(&self.server_addr, api_path)) {
+            Ok(_) => {
+                // 4. Success! Generate a new inode and cache it locally
+                let mut inode_map_locked = self.inode_map.lock().unwrap();
+                let mut path_to_inode_locked = self.path_to_inode.lock().unwrap();
+                let mut next_inode_locked = self.next_inode.lock().unwrap();
+
+                let new_ino = *next_inode_locked;
+                *next_inode_locked += 1;
+
+                // Create attributes for the new directory.
+                // We use the mode provided by the OS, or fallback to 0o755.
+                let attr = create_file_attr(new_ino, FileType::Directory, 0, mode as u16);
+
+                inode_map_locked.insert(new_ino, attr);
+                path_to_inode_locked.insert(full_path.clone(), new_ino);
+
+                debug!("Successfully created and cached new directory: ino={}, path='{}'", new_ino, full_path);
+
+                // Tell the OS we succeeded and hand it the new attributes
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(err) => {
+                error!("Failed to create directory {} on server: {:?}", api_path, err);
+                reply.error(libc::EIO); // I/O Error
+            }
+        }
+    }
+
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         debug!("open(ino={})", ino);
 

@@ -59,3 +59,20 @@ pub async fn read_file(base_url: &str, path: &str) -> Result<Vec<u8>, reqwest::E
 
     Ok(bytes.to_vec())
 }
+
+pub async fn create_directory(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+
+    let request_url = format!("{}/mkdir/{}", normalized_base, normalized_path);
+    log::debug!("Requesting directory creation: POST {}", request_url);
+
+    // Create a reqwest client to send the POST request
+    let client = reqwest::Client::new();
+    let response = client.post(&request_url).send().await?;
+
+    // If the server returns an error (like 404 or 500), this turns it into a Rust Error
+    response.error_for_status()?;
+
+    Ok(())
+}

@@ -31,7 +31,7 @@ fn main() {
     let options = vec![
         MountOption::FSName("remoteFS".to_string()),
         MountOption::AutoUnmount,
-        MountOption::AllowRoot, // Optional: consider security implications
+        //MountOption::AllowRoot, // Optional: consider security implications
     ];
 
     // Correct instantiation based on client/src/fuse.rs RemoteFs::new which does not return a Result

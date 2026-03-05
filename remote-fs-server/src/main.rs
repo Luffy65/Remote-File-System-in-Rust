@@ -6,9 +6,17 @@
 //
 // The server will listen on `0.0.0.0:3000`.
 
-use axum::{extract::Path,http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{extract::Path,http::StatusCode, response::IntoResponse, routing::get, Json, Router, routing::post};
 use serde::Serialize;
 use std::net::SocketAddr;
+
+// Handler for the `POST /mkdir/*path` endpoint.
+async fn make_directory(Path(path): Path<String>) -> impl IntoResponse {
+    println!("Mock Server: Creating directory at /{}", path);
+
+    // We just pretend it succeeded and return a 201 Created status
+    (StatusCode::CREATED, format!("Directory {} created", path))
+}
 
 // Handler for the `GET /files/*path` endpoint.
 // Returns the mock byte content for specific files.
@@ -122,8 +130,8 @@ async fn main() {
     let app = Router::new()
         .route("/list/", get(list_root)) // Route for listing the root directory
         .route("/list/*path", get(list_path)) // Route for listing a specific path
-        .route("/files/*path", get(get_file)); // Route for getting file content
-
+        .route("/files/*path", get(get_file)) // Route for getting file content
+        .route("/mkdir/*path", post(make_directory)); // Route for creating a directory
     // Define the server address.
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Mock server listening on {}", addr);
