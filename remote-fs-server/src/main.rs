@@ -6,9 +6,36 @@
 //
 // The server will listen on `0.0.0.0:3000`.
 
-use axum::{extract::Path, routing::get, Json, Router};
+use axum::{extract::Path,http::StatusCode, response::IntoResponse, routing::get, Json, Router, routing::post};
 use serde::Serialize;
 use std::net::SocketAddr;
+
+// Handler for the `POST /mkdir/*path` endpoint.
+async fn make_directory(Path(path): Path<String>) -> impl IntoResponse {
+    println!("Mock Server: Creating directory at /{}", path);
+
+    // We just pretend it succeeded and return a 201 Created status
+    (StatusCode::CREATED, format!("Directory {} created", path))
+}
+
+// Handler for the `GET /files/*path` endpoint.
+// Returns the mock byte content for specific files.
+async fn get_file(Path(path): Path<String>) -> impl IntoResponse {
+    match path.as_str() {
+        "folder1/file1.txt" => {
+            // "Hello from file1.txt!\n" is exactly 22 bytes. 
+            // Make sure to update the 'size' in list_path to 22!
+            (StatusCode::OK, "Hello from file1.txt!\n".to_string())
+        }
+        "image.jpg" => {
+            // Just a dummy string for the image
+            (StatusCode::OK, "Fake image data...".to_string())
+        }
+        _ => {
+            (StatusCode::NOT_FOUND, "File not found".to_string())
+        }
+    }
+}
 
 /// Represents a directory entry (file or directory).
 #[derive(Serialize)]
@@ -88,7 +115,7 @@ async fn list_path(Path(path): Path<String>) -> Json<Vec<DirectoryEntry>> {
         let entries = vec![DirectoryEntry {
             name: "file1.txt".to_string(),
             type_: "file".to_string(),
-            size: 1024,
+            size: 22,
             modified_at: "2024-05-23T12:05:00Z".to_string(),
         }];
         Json(entries)
@@ -102,8 +129,9 @@ async fn main() {
     // Define the Axum application router.
     let app = Router::new()
         .route("/list/", get(list_root)) // Route for listing the root directory
-        .route("/list/*path", get(list_path)); // Route for listing a specific path
-
+        .route("/list/*path", get(list_path)) // Route for listing a specific path
+        .route("/files/*path", get(get_file)) // Route for getting file content
+        .route("/mkdir/*path", post(make_directory)); // Route for creating a directory
     // Define the server address.
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Mock server listening on {}", addr);
