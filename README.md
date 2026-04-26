@@ -61,24 +61,32 @@ The server can be implemented using any language or framework, but should be RES
 
 ## Notes
 
-Il logging (log::info!, log::debug!) è tuo amico durante lo sviluppo di un filesystem FUSE.
+Logging (log::info!, log::debug!) is your friend during the development of a FUSE filesystem.
 
 ## TODO
 
-* Move from a mock server to a real server
+### Server Endpoints
 
-* **Task:** Define the `GET /files/path` server endpoint for reading file content.
-    * The mock server should be updated to serve predefined content for a specific file path (e.g., `GET /files/hello.txt` returns "Hello, World!").
-* **Task:** In the Rust FUSE client, implement the `lookup` FUSE operation.
-    * When a file is looked up, the client should (for now) just confirm its existence based on a simulated call or by checking if it was listed by `readdir`.
-* **Task:** Implement the `getattr` FUSE operation.
-    * This should return basic attributes (like file type, size, permissions) for files and directories. For now, the size can be hardcoded for the mock file or derived from the mock server's `/list` response.
-* **Task:** Implement the `open` and `read` FUSE operations.
-    * `open`: Can be a simple pass-through for now, ensuring the file type is regular.
-    * `read`:
-        1.  Receive a path and offset from the FUSE kernel.
-        2.  Make an HTTP GET request to the mock server's `GET /files/path_from_fuse`.
-        3.  Return the (mock) file content to the FUSE kernel via `reply.data()`.
-* **Goal:** Be able to `cat /mnt/remote-fs/hello.txt` (or equivalent) and see the content served by your mock server.
+- [ ] `PUT /files/*path` – Write file contents (replace/create)
+- [ ] `DELETE /files/*path` – Delete file or directory
 
----
+### Client API Functions
+
+- [ ] `write_file()` – Send file write requests
+- [ ] `delete_file()` – Send file delete requests
+- [ ] `rename_file()` – Send file rename requests
+
+### FUSE Operations
+
+- [ ] `write()` – Write file data
+- [ ] `unlink()` – Delete files
+- [ ] `rmdir()` – Delete directories
+- [ ] `rename()` – Rename/move files
+
+### Improvements
+
+- [ ] Better file permission handling (currently hardcoded)
+- [ ] Proper file modification timestamps (currently `SystemTime::now()`)
+- [ ] Graceful shutdown with signal handling
+- [ ] File handle tracking for proper resource management
+- [ ] Better error handling and logging
