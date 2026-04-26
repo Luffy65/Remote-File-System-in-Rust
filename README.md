@@ -65,9 +65,7 @@ Il logging (log::info!, log::debug!) è tuo amico durante lo sviluppo di un file
 
 ## TODO
 
-### Phase 1: Core Setup & Basic Server Interaction
-
-#### 🎯 Sub-Goal 4: Basic File Read (Read-Only)
+* Move from a mock server to a real server
 
 * **Task:** Define the `GET /files/path` server endpoint for reading file content.
     * The mock server should be updated to serve predefined content for a specific file path (e.g., `GET /files/hello.txt` returns "Hello, World!").
