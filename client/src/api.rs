@@ -76,3 +76,43 @@ pub async fn create_directory(base_url: &str, path: &str) -> Result<(), reqwest:
 
     Ok(())
 }
+
+// Sends an empty file to the server
+pub async fn create_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+
+    log::debug!("API: Creating new empty file via PUT {}", request_url);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(&request_url)
+        .header("X-File-Offset", "0")
+        .body(vec![]) // Empty body to initialize the file
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+    Ok(())
+}
+
+// Sends a chunk of bytes to the server at a specific offset
+pub async fn write_file(base_url: &str, path: &str, data: &[u8], offset: u64) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+
+    log::debug!("API: Writing {} bytes at offset {} to {}", data.len(), offset, request_url);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(&request_url)
+        .header("X-File-Offset", offset.to_string())
+        .body(data.to_vec())
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+    Ok(())
+}

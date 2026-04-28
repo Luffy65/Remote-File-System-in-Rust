@@ -263,6 +263,176 @@ impl Filesystem for RemoteFs {
         }
     }
 
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let name_str = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+        debug!("create(parent={}, name='{}', mode={:o})", parent, name_str, mode);
+
+        // 1. Find the parent directory's path
+        let parent_path_str = {
+            let path_to_inode_map = self.path_to_inode.lock().unwrap();
+            path_to_inode_map.iter()
+                .find_map(|(path, &inode)| if inode == parent { Some(path.clone()) } else { None })
+                .unwrap_or_else(|| "/".to_string())
+        };
+
+        // 2. Construct the full path
+        let full_path = if parent_path_str == "/" {
+            format!("/{}", name_str)
+        } else {
+            format!("{}/{}", parent_path_str.trim_end_matches('/'), name_str)
+        };
+        let api_path = full_path.trim_start_matches('/');
+
+        // 3. Tell the remote server to initialize the empty file
+        match self.runtime.block_on(api::create_file(&self.server_addr, api_path)) {
+            Ok(_) => {
+                // 4. Update the local cache with the new inode
+                let mut inode_map_locked = self.inode_map.lock().unwrap();
+                let mut path_to_inode_locked = self.path_to_inode.lock().unwrap();
+                let mut next_inode_locked = self.next_inode.lock().unwrap();
+
+                let new_ino = *next_inode_locked;
+                *next_inode_locked += 1;
+
+                let attr = create_file_attr(new_ino, FileType::RegularFile, 0, mode as u16);
+
+                inode_map_locked.insert(new_ino, attr);
+                path_to_inode_locked.insert(full_path.clone(), new_ino);
+
+                debug!("Successfully created file: ino={}, path='{}'", new_ino, full_path);
+
+                // Reply with the new attributes, generation 0, file handle 0, and no special flags
+                reply.created(&TTL, &attr, 0, 0, 0);
+            }
+            Err(err) => {
+                error!("Failed to create file {} on server: {:?}", api_path, err);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        debug!("write(ino={}, offset={}, size={})", ino, offset, data.len());
+
+        // 1. Find the file's path using the inode
+        let path = {
+            let path_map = self.path_to_inode.lock().unwrap();
+            path_map.iter().find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
+        };
+
+        let file_path = match path {
+            Some(p) => p,
+            None => {
+                error!("write: Could not find path for ino {}", ino);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        let api_path = file_path.trim_start_matches('/');
+
+        // 2. Send the chunk of bytes to the server
+        match self.runtime.block_on(api::write_file(&self.server_addr, api_path, data, offset as u64)) {
+            Ok(_) => {
+                // 3. Update the file size in our local cache so `ls` shows the correct size
+                let mut inode_map = self.inode_map.lock().unwrap();
+                if let Some(attr) = inode_map.get_mut(&ino) {
+                    let new_size = std::cmp::max(attr.size, (offset as u64) + (data.len() as u64));
+                    attr.size = new_size;
+                    attr.blocks = (new_size + 511) / 512;
+                    attr.mtime = SystemTime::now(); // Update modified time
+                }
+
+                // 4. Tell the OS exactly how many bytes we successfully wrote
+                reply.written(data.len() as u32);
+            }
+            Err(err) => {
+                error!("Failed to write to file {} on server: {:?}", api_path, err);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        debug!("setattr(ino={}, size={:?})", ino, size);
+
+        // 1. Resolve path (needed in case we are truncating the file to 0 bytes)
+        let path = {
+            let path_map = self.path_to_inode.lock().unwrap();
+            path_map.iter().find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
+        };
+
+        // If the OS wants to truncate the file to 0 bytes, we tell the server to create an empty file over it.
+        if let Some(s) = size {
+            if s == 0 {
+                if let Some(ref p) = path {
+                    let api_path = p.trim_start_matches('/');
+                    let _ = self.runtime.block_on(api::create_file(&self.server_addr, api_path));
+                }
+            }
+        }
+
+        // 2. Update local cache attributes
+        let mut inode_map = self.inode_map.lock().unwrap();
+        if let Some(attr) = inode_map.get_mut(&ino) {
+            if let Some(s) = size {
+                attr.size = s;
+                attr.blocks = (s + 511) / 512;
+            }
+            if let Some(m) = mode { attr.perm = m as u16; }
+            if let Some(u) = uid { attr.uid = u; }
+            if let Some(g) = gid { attr.gid = g; }
+
+            attr.mtime = SystemTime::now();
+
+            reply.attr(&TTL, attr);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+    
     fn read(
         &mut self,
         _req: &Request,

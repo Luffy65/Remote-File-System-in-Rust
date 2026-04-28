@@ -1,14 +1,26 @@
-// This is a mock server for a remote file system.
+// This is a server for a remote file system.
 // It provides a basic API for listing directory contents.
 //
-// To run the server, navigate to the `remote-fs-server` directory
+// To run the server, navigate to the `server` directory
 // and run the command: `cargo run`
 //
 // The server will listen on `0.0.0.0:3000`.
 
-use axum::{extract::Path,http::StatusCode, response::IntoResponse, routing::get, Json, Router, routing::post};
+use axum::{body::Bytes,
+           extract::{Path, State},
+           http::{HeaderMap, StatusCode},
+           response::IntoResponse,
+           routing::{get, post, put},
+           Json, Router,
+};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+struct AppState {
+    file_contents: Mutex<HashMap<String, Vec<u8>>>,
+}
 
 // Handler for the `POST /mkdir/*path` endpoint.
 async fn make_directory(Path(path): Path<String>) -> impl IntoResponse {
@@ -19,22 +31,37 @@ async fn make_directory(Path(path): Path<String>) -> impl IntoResponse {
 }
 
 // Handler for the `GET /files/*path` endpoint.
-// Returns the mock byte content for specific files.
-async fn get_file(Path(path): Path<String>) -> impl IntoResponse {
-    match path.as_str() {
-        "folder1/file1.txt" => {
-            // "Hello from file1.txt!\n" is exactly 22 bytes. 
-            // Make sure to update the 'size' in list_path to 22!
-            (StatusCode::OK, "Hello from file1.txt!\n".to_string())
-        }
-        "image.jpg" => {
-            // Just a dummy string for the image
-            (StatusCode::OK, "Fake image data...".to_string())
-        }
-        _ => {
-            (StatusCode::NOT_FOUND, "File not found".to_string())
-        }
+async fn get_file(Path(path): Path<String>, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let contents = state.file_contents.lock().unwrap();
+
+    if let Some(data) = contents.get(&path) {
+    (StatusCode::OK, data.clone()).into_response()
+    } else {
+    (StatusCode::NOT_FOUND, "File not found".to_string()).into_response()
     }
+}
+
+//Handler per `PUT /files/*path`
+async fn write_file(Path(path): Path<String>, headers: HeaderMap, State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let offset: usize = headers
+        .get("X-File-Offset")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    println!("Mock Server: Ricevuti {} byte per /{} (offset: {})", body.len(), path, offset);
+
+    let mut contents = state.file_contents.lock().unwrap();
+
+    let file_data = contents.entry(path).or_insert_with(Vec::new);
+
+    if file_data.len() < offset + body.len() {
+        file_data.resize(offset + body.len(), 0);
+    }
+
+    file_data[offset..offset + body.len()].copy_from_slice(&body);
+
+    StatusCode::OK
 }
 
 /// Represents a directory entry (file or directory).
@@ -126,12 +153,21 @@ async fn list_path(Path(path): Path<String>) -> Json<Vec<DirectoryEntry>> {
 
 #[tokio::main]
 async fn main() {
+    let mut initial_contents = HashMap::new();
+    initial_contents.insert("folder1/file1.txt".to_string(), b"Hello from file1.txt!\n".to_vec());
+    initial_contents.insert("image.jpg".to_string(), b"Fake image data...".to_vec());
+
+    let shared_state = Arc::new(AppState {
+        file_contents: Mutex::new(initial_contents),
+    });
     // Define the Axum application router.
     let app = Router::new()
         .route("/list/", get(list_root)) // Route for listing the root directory
         .route("/list/*path", get(list_path)) // Route for listing a specific path
         .route("/files/*path", get(get_file)) // Route for getting file content
-        .route("/mkdir/*path", post(make_directory)); // Route for creating a directory
+        .route("/files/*path", put(write_file)) // Route for uploading and saving file contents to the server
+        .route("/mkdir/*path", post(make_directory)) // Route for creating a directory
+        .with_state(shared_state);
     // Define the server address.
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Mock server listening on {}", addr);

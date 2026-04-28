@@ -1,5 +1,7 @@
 mod fuse; // Ensure fuse module is declared
-mod api;  // Ensure api module is declared
+mod api;
+mod cache;
+// Ensure api module is declared
 
 use std::env;
 use fuser::MountOption;
