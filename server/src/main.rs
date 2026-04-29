@@ -49,7 +49,7 @@ async fn write_file(Path(path): Path<String>, headers: HeaderMap, State(state): 
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    println!("Mock Server: Ricevuti {} byte per /{} (offset: {})", body.len(), path, offset);
+    println!("Mock Server: Received {} byte for /{} (offset: {})", body.len(), path, offset);
 
     let mut contents = state.file_contents.lock().unwrap();
 
@@ -160,7 +160,7 @@ async fn main() {
     let shared_state = Arc::new(AppState {
         file_contents: Mutex::new(initial_contents),
     });
-    // Define the Axum application router.
+    // Define Axum application router.
     let app = Router::new()
         .route("/list/", get(list_root)) // Route for listing the root directory
         .route("/list/*path", get(list_path)) // Route for listing a specific path
@@ -175,4 +175,60 @@ async fn main() {
     // Start the Axum server using the new API.
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, Method, StatusCode},
+    };
+    use tower::ServiceExt; // Required to use `.oneshot()` for testing Routers
+
+    #[tokio::test]
+    async fn test_file_chunked_upload() {
+        // 1. Setup a fresh, empty server state
+        let shared_state = Arc::new(AppState {
+            file_contents: Mutex::new(HashMap::new()),
+        });
+
+        // 2. Build the router with just the PUT endpoint
+        let app = Router::new()
+            .route("/files/*path", axum::routing::put(write_file))
+            .with_state(shared_state.clone());
+
+        // 3. Simulating the FUSE client sending the FIRST chunk (Offset 0)
+        let request_one = Request::builder()
+            .method(Method::PUT)
+            .uri("/files/test_upload.txt")
+            .header("X-File-Offset", "0")
+            .body(Body::from("Hello "))
+            .unwrap();
+
+        // Send the first request
+        let response_one = app.clone().oneshot(request_one).await.unwrap();
+        assert_eq!(response_one.status(), StatusCode::OK);
+
+        // 4. Simulating the FUSE client sending the SECOND chunk (Offset 6)
+        let request_two = Request::builder()
+            .method(Method::PUT)
+            .uri("/files/test_upload.txt")
+            .header("X-File-Offset", "6") // Start writing after "Hello "
+            .body(Body::from("World!"))
+            .unwrap();
+
+        // Send the second request
+        let response_two = app.oneshot(request_two).await.unwrap();
+        assert_eq!(response_two.status(), StatusCode::OK);
+
+        // 5. Check the server's RAM directly
+        let contents = shared_state.file_contents.lock().unwrap();
+        let saved_file = contents.get("test_upload.txt").expect("File was not created in memory!");
+
+        // Assert that the two chunks were stitched together perfectly
+        assert_eq!(saved_file, b"Hello World!");
+    }
 }
