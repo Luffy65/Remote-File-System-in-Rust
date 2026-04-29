@@ -1,6 +1,6 @@
 use log;
 use reqwest;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Debug)]
 pub struct DirectoryEntry {
@@ -34,10 +34,16 @@ pub async fn list_directory(
         Ok(entries)
     } else {
         let status = response.status();
-        let err_msg = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        let err_msg = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
         log::error!("Error fetching directory list: {} - {}", status, err_msg);
         // Return an error by making a failing request to get a proper reqwest::Error
-        reqwest::get("http://invalid-non-existent-server-domain-12345").await.map(|_| vec![]).map_err(|e| e)
+        reqwest::get("http://invalid-non-existent-server-domain-12345")
+            .await
+            .map(|_| vec![])
+            .map_err(|e| e)
     }
 }
 
@@ -98,18 +104,75 @@ pub async fn create_file(base_url: &str, path: &str) -> Result<(), reqwest::Erro
 }
 
 // Sends a chunk of bytes to the server at a specific offset
-pub async fn write_file(base_url: &str, path: &str, data: &[u8], offset: u64) -> Result<(), reqwest::Error> {
+pub async fn write_file(
+    base_url: &str,
+    path: &str,
+    data: &[u8],
+    offset: u64,
+) -> Result<(), reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
     let request_url = format!("{}/files/{}", normalized_base, normalized_path);
 
-    log::debug!("API: Writing {} bytes at offset {} to {}", data.len(), offset, request_url);
+    log::debug!(
+        "API: Writing {} bytes at offset {} to {}",
+        data.len(),
+        offset,
+        request_url
+    );
 
     let client = reqwest::Client::new();
     let response = client
         .put(&request_url)
         .header("X-File-Offset", offset.to_string())
         .body(data.to_vec())
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+    Ok(())
+}
+
+pub async fn delete_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+
+    log::debug!("API: Deleting {}", request_url);
+
+    let client = reqwest::Client::new();
+    let response = client.delete(&request_url).send().await?;
+
+    response.error_for_status()?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct RenameRequest<'a> {
+    from: &'a str,
+    to: &'a str,
+}
+
+pub async fn rename_file(base_url: &str, from: &str, to: &str) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let request_url = format!("{}/rename", normalized_base);
+    let normalized_from = from.trim_start_matches('/');
+    let normalized_to = to.trim_start_matches('/');
+
+    log::debug!(
+        "API: Renaming {} to {} via POST {}",
+        normalized_from,
+        normalized_to,
+        request_url
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&request_url)
+        .json(&RenameRequest {
+            from: normalized_from,
+            to: normalized_to,
+        })
         .send()
         .await?;
 

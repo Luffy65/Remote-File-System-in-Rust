@@ -1,11 +1,11 @@
-mod fuse; // Ensure fuse module is declared
 mod api;
 mod cache;
+mod fuse; // Ensure fuse module is declared
 // Ensure api module is declared
 
-use std::env;
 use fuser::MountOption;
 use log;
+use std::env;
 
 // The RemoteFs struct and its Filesystem impl are now in fuse.rs
 
@@ -15,7 +15,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <MOUNTPOINT> [SERVER_URL]", args.get(0).map_or("remote-fs-client", |s| s.as_str()));
+        eprintln!(
+            "Usage: {} <MOUNTPOINT> [SERVER_URL]",
+            args.get(0).map_or("remote-fs-client", |s| s.as_str())
+        );
         std::process::exit(1);
     }
 
@@ -25,7 +28,7 @@ fn main() {
             log::info!("No server URL provided, defaulting to http://localhost:3000");
             "http://localhost:3000".to_string()
         },
-        |url| url.clone()
+        |url| url.clone(),
     );
 
     log::info!("Mounting to {}, server URL: {}", mountpoint, server_url);
@@ -41,7 +44,10 @@ fn main() {
 
     match fuser::mount2(fs, mountpoint, &options) {
         Ok(_) => {
-            log::info!("Filesystem mounted successfully on {}. Press Ctrl-C to unmount.", mountpoint);
+            log::info!(
+                "Filesystem mounted successfully on {}. Press Ctrl-C to unmount.",
+                mountpoint
+            );
             // mount2 blocks until unmounted, so nothing more to do here for a simple client.
             // For a more complex application, you might join a thread or handle signals.
         }

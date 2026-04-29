@@ -19,9 +19,9 @@ This project aims to implement a remote file system client in Rust that presents
 
 - [x] Mount a virtual file system to a local path (e.g., /mnt/remote-fs )
 - [x] Display directories and files from a remote source
-- [ ] Read files from the remote server
-- [ ] Write modified files back to the remote server
-- [ ] Support creation, deletion, and renaming of files and directories
+- [x] Read files from the remote server
+- [x] Write modified files back to the remote server
+- [x] Support creation, deletion, and renaming of files and directories
 - [ ] Maintain file attributes such as size, timestamps, and permissions (as feasible)
 - [ ] Run as a background daemon process that handles filesystem operations continuously
 
@@ -34,6 +34,7 @@ The server should offer a set RESTful API for file operations:
 - PUT /files/`path` – Write file contents
 - POST /mkdir/`path` – Create directory
 - DELETE /files/`path` – Delete file or directory
+- POST /rename – Rename or move a file/directory
 
 The server can be implemented using any language or framework, but should be RESTful and stateless.
 
@@ -67,24 +68,39 @@ Logging (log::info!, log::debug!) is your friend during the development of a FUS
 
 ### Server Endpoints
 
-- [ ] `PUT /files/*path` – Write file contents (replace/create)
-- [ ] `DELETE /files/*path` – Delete file or directory
+- [x] `GET /list/*path` – List directory contents
+- [x] `GET /files/*path` – Read file contents
+- [x] `PUT /files/*path` – Write file contents (replace/create)
+- [x] `POST /mkdir/*path` – Create directory
+- [x] `DELETE /files/*path` – Delete file or directory
+- [x] `POST /rename` – Rename or move file/directory
 
 ### Client API Functions
 
-- [ ] `write_file()` – Send file write requests
-- [ ] `delete_file()` – Send file delete requests
-- [ ] `rename_file()` – Send file rename requests
+- [x] `list_directory()` – Send directory listing requests
+- [x] `read_file()` – Send file read requests
+- [x] `create_file()` – Send empty file creation requests
+- [x] `create_directory()` – Send directory creation requests
+- [x] `write_file()` – Send file write requests
+- [x] `delete_file()` – Send file delete requests
+- [x] `rename_file()` – Send file rename requests
 
 ### FUSE Operations
 
-- [ ] `write()` – Write file data
-- [ ] `unlink()` – Delete files
-- [ ] `rmdir()` – Delete directories
-- [ ] `rename()` – Rename/move files
+- [x] `lookup()` – Resolve paths to inodes
+- [x] `getattr()` – Return file and directory attributes
+- [x] `readdir()` – List directory entries
+- [x] `read()` – Read file data
+- [x] `create()` – Create files
+- [x] `mkdir()` – Create directories
+- [x] `write()` – Write file data
+- [x] `unlink()` – Delete files
+- [x] `rmdir()` – Delete directories
+- [x] `rename()` – Rename/move files
 
 ### Improvements
 
+- [ ] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
 - [ ] Better file permission handling (currently hardcoded)
 - [ ] Proper file modification timestamps (currently `SystemTime::now()`)
 - [ ] Graceful shutdown with signal handling

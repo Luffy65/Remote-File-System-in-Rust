@@ -1,8 +1,8 @@
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
-    FUSE_ROOT_ID,
+    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, Request,
 };
-use libc::{c_int, ENOENT};
+use libc::{ENOENT, c_int};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -55,7 +55,10 @@ impl RemoteFs {
         inode_map_val.insert(FUSE_ROOT_ID, root_attr);
         path_to_inode_val.insert("/".to_string(), FUSE_ROOT_ID);
 
-        info!("RemoteFs initialized. Root inode: {}, Path: /", FUSE_ROOT_ID);
+        info!(
+            "RemoteFs initialized. Root inode: {}, Path: /",
+            FUSE_ROOT_ID
+        );
 
         RemoteFs {
             server_addr: server_addr.to_string(),
@@ -63,6 +66,144 @@ impl RemoteFs {
             inode_map: Arc::new(Mutex::new(inode_map_val)),
             path_to_inode: Arc::new(Mutex::new(path_to_inode_val)),
             next_inode: Arc::new(Mutex::new(FUSE_ROOT_ID + 1)),
+        }
+    }
+
+    // Finds the cached path that belongs to an inode.
+    fn path_for_inode(&self, ino: u64) -> Option<String> {
+        let path_map = self.path_to_inode.lock().unwrap();
+        path_map.iter().find_map(|(path, &inode)| {
+            if inode == ino {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    // Builds a full child path from a parent inode and a file name.
+    fn child_path(&self, parent: u64, name: &OsStr) -> Result<String, c_int> {
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
+        let parent_path = self.path_for_inode(parent).ok_or(ENOENT)?;
+
+        if parent_path == "/" {
+            Ok(format!("/{}", name_str))
+        } else {
+            Ok(format!(
+                "{}/{}",
+                parent_path.trim_end_matches('/'),
+                name_str
+            ))
+        }
+    }
+
+    // Resolves rename sources, including macOS cases where macFUSE reports a truncated name.
+    fn resolve_rename_source_path(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        newname: &OsStr,
+    ) -> Result<String, c_int> {
+        let full_path = self.child_path(parent, name)?;
+
+        {
+            let path_to_inode = self.path_to_inode.lock().unwrap();
+            if path_to_inode.contains_key(&full_path) {
+                return Ok(full_path);
+            }
+        }
+
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
+        let newname_str = newname.to_str().ok_or(libc::EINVAL)?;
+        let wants_appledouble = newname_str.starts_with("._");
+        let parent_path = self.path_for_inode(parent).ok_or(ENOENT)?;
+        let parent_prefix = if parent_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", parent_path.trim_end_matches('/'))
+        };
+
+        let path_to_inode = self.path_to_inode.lock().unwrap();
+        let mut candidates: Vec<String> = path_to_inode
+            .keys()
+            .filter_map(|path| {
+                let child_name = path.strip_prefix(&parent_prefix)?;
+                if child_name.contains('/') || !child_name.ends_with(name_str) {
+                    return None;
+                }
+                Some(path.clone())
+            })
+            .collect();
+
+        candidates.retain(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|child_name| child_name.starts_with("._") == wants_appledouble)
+        });
+
+        if candidates.len() == 1 {
+            Ok(candidates.remove(0))
+        } else {
+            Ok(full_path)
+        }
+    }
+
+    // Removes a cached path and all cached children below it.
+    fn remove_cached_path(&self, path: &str) {
+        let mut inode_map = self.inode_map.lock().unwrap();
+        let mut path_to_inode = self.path_to_inode.lock().unwrap();
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let removed_paths: Vec<String> = path_to_inode
+            .keys()
+            .filter(|cached_path| *cached_path == path || cached_path.starts_with(&prefix))
+            .cloned()
+            .collect();
+
+        for removed_path in removed_paths {
+            if let Some(ino) = path_to_inode.remove(&removed_path) {
+                inode_map.remove(&ino);
+            }
+        }
+    }
+
+    // Moves cached paths from one prefix to another after a successful server rename.
+    fn rename_cached_path(&self, from: &str, to: &str) {
+        let mut inode_map = self.inode_map.lock().unwrap();
+        let mut path_to_inode = self.path_to_inode.lock().unwrap();
+        let prefix = format!("{}/", from.trim_end_matches('/'));
+        let moved_paths: Vec<(String, u64)> = path_to_inode
+            .iter()
+            .filter(|(cached_path, _)| *cached_path == from || cached_path.starts_with(&prefix))
+            .map(|(cached_path, &ino)| (cached_path.clone(), ino))
+            .collect();
+
+        let destination_prefix = format!("{}/", to.trim_end_matches('/'));
+        let overwritten_paths: Vec<String> = path_to_inode
+            .keys()
+            .filter(|cached_path| {
+                *cached_path == to || cached_path.starts_with(&destination_prefix)
+            })
+            .cloned()
+            .collect();
+
+        for overwritten_path in overwritten_paths {
+            if let Some(ino) = path_to_inode.remove(&overwritten_path) {
+                inode_map.remove(&ino);
+            }
+        }
+
+        for (old_path, _) in &moved_paths {
+            path_to_inode.remove(old_path);
+        }
+
+        for (old_path, ino) in moved_paths {
+            let new_path = if old_path == from {
+                to.to_string()
+            } else {
+                let suffix = old_path.strip_prefix(&prefix).unwrap_or("");
+                format!("{}/{}", to.trim_end_matches('/'), suffix)
+            };
+            path_to_inode.insert(new_path, ino);
         }
     }
 }
@@ -89,13 +230,23 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
-        debug!("mkdir(parent={}, name='{}', mode={:o})", parent, name_str, mode);
+        debug!(
+            "mkdir(parent={}, name='{}', mode={:o})",
+            parent, name_str, mode
+        );
 
         // 1. Find the parent directory's path
         let parent_path_str = {
             let path_to_inode_map = self.path_to_inode.lock().unwrap();
-            path_to_inode_map.iter()
-                .find_map(|(path, &inode)| if inode == parent { Some(path.clone()) } else { None })
+            path_to_inode_map
+                .iter()
+                .find_map(|(path, &inode)| {
+                    if inode == parent {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| "/".to_string())
         };
 
@@ -109,7 +260,10 @@ impl Filesystem for RemoteFs {
         let api_path = full_path.trim_start_matches('/');
 
         // 3. Tell the remote server to create it
-        match self.runtime.block_on(api::create_directory(&self.server_addr, api_path)) {
+        match self
+            .runtime
+            .block_on(api::create_directory(&self.server_addr, api_path))
+        {
             Ok(_) => {
                 // 4. Success! Generate a new inode and cache it locally
                 let mut inode_map_locked = self.inode_map.lock().unwrap();
@@ -126,13 +280,19 @@ impl Filesystem for RemoteFs {
                 inode_map_locked.insert(new_ino, attr);
                 path_to_inode_locked.insert(full_path.clone(), new_ino);
 
-                debug!("Successfully created and cached new directory: ino={}, path='{}'", new_ino, full_path);
+                debug!(
+                    "Successfully created and cached new directory: ino={}, path='{}'",
+                    new_ino, full_path
+                );
 
                 // Tell the OS we succeeded and hand it the new attributes
                 reply.entry(&TTL, &attr, 0);
             }
             Err(err) => {
-                error!("Failed to create directory {} on server: {:?}", api_path, err);
+                error!(
+                    "Failed to create directory {} on server: {:?}",
+                    api_path, err
+                );
                 reply.error(libc::EIO); // I/O Error
             }
         }
@@ -173,10 +333,20 @@ impl Filesystem for RemoteFs {
         // 1. Determine the parent path
         let parent_path_str = {
             let path_to_inode_map = self.path_to_inode.lock().unwrap();
-            path_to_inode_map.iter()
-                .find_map(|(path, &inode)| if inode == parent_ino { Some(path.clone()) } else { None })
+            path_to_inode_map
+                .iter()
+                .find_map(|(path, &inode)| {
+                    if inode == parent_ino {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| {
-                    warn!("Parent path for ino {} not found, defaulting to root.", parent_ino);
+                    warn!(
+                        "Parent path for ino {} not found, defaulting to root.",
+                        parent_ino
+                    );
                     "/".to_string()
                 })
         };
@@ -204,7 +374,10 @@ impl Filesystem for RemoteFs {
         } // The Mutex locks are safely dropped here!
 
         // 3. Cache Miss: Ask the server about the parent directory
-        debug!("CACHE MISS: Fetching parent directory '{}' from server...", parent_path_str);
+        debug!(
+            "CACHE MISS: Fetching parent directory '{}' from server...",
+            parent_path_str
+        );
 
         let api_path = if parent_path_str == "/" {
             "".to_string()
@@ -212,11 +385,13 @@ impl Filesystem for RemoteFs {
             parent_path_str.trim_start_matches('/').to_string()
         };
 
-        match self.runtime.block_on(api::list_directory(&self.server_addr, &api_path)) {
+        match self
+            .runtime
+            .block_on(api::list_directory(&self.server_addr, &api_path))
+        {
             Ok(api_entries) => {
                 // Look for the specific file the OS asked for in the server's response
                 if let Some(api_entry) = api_entries.into_iter().find(|e| e.name == name_str) {
-
                     // We found it! Generate a new inode and cache it.
                     let mut inode_map_locked = self.inode_map.lock().unwrap();
                     let mut path_to_inode_locked = self.path_to_inode.lock().unwrap();
@@ -225,8 +400,16 @@ impl Filesystem for RemoteFs {
                     let new_ino = *next_inode_locked;
                     *next_inode_locked += 1;
 
-                    let kind = if api_entry.type_ == "directory" { FileType::Directory } else { FileType::RegularFile };
-                    let perm = if kind == FileType::Directory { 0o755 } else { 0o644 };
+                    let kind = if api_entry.type_ == "directory" {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
+                    let perm = if kind == FileType::Directory {
+                        0o755
+                    } else {
+                        0o644
+                    };
 
                     // Reusing your helper function
                     let attr = create_file_attr(new_ino, kind, api_entry.size, perm);
@@ -234,9 +417,11 @@ impl Filesystem for RemoteFs {
                     inode_map_locked.insert(new_ino, attr);
                     path_to_inode_locked.insert(full_path.clone(), new_ino);
 
-                    debug!("Dynamically added new entry to cache: ino={}, path='{}'", new_ino, full_path);
+                    debug!(
+                        "Dynamically added new entry to cache: ino={}, path='{}'",
+                        new_ino, full_path
+                    );
                     reply.entry(&TTL, &attr, 0);
-
                 } else {
                     debug!("Path {} genuinely does not exist on the server.", full_path);
                     reply.error(ENOENT);
@@ -280,13 +465,23 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
-        debug!("create(parent={}, name='{}', mode={:o})", parent, name_str, mode);
+        debug!(
+            "create(parent={}, name='{}', mode={:o})",
+            parent, name_str, mode
+        );
 
         // 1. Find the parent directory's path
         let parent_path_str = {
             let path_to_inode_map = self.path_to_inode.lock().unwrap();
-            path_to_inode_map.iter()
-                .find_map(|(path, &inode)| if inode == parent { Some(path.clone()) } else { None })
+            path_to_inode_map
+                .iter()
+                .find_map(|(path, &inode)| {
+                    if inode == parent {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| "/".to_string())
         };
 
@@ -299,7 +494,10 @@ impl Filesystem for RemoteFs {
         let api_path = full_path.trim_start_matches('/');
 
         // 3. Tell the remote server to initialize the empty file
-        match self.runtime.block_on(api::create_file(&self.server_addr, api_path)) {
+        match self
+            .runtime
+            .block_on(api::create_file(&self.server_addr, api_path))
+        {
             Ok(_) => {
                 // 4. Update the local cache with the new inode
                 let mut inode_map_locked = self.inode_map.lock().unwrap();
@@ -314,7 +512,10 @@ impl Filesystem for RemoteFs {
                 inode_map_locked.insert(new_ino, attr);
                 path_to_inode_locked.insert(full_path.clone(), new_ino);
 
-                debug!("Successfully created file: ino={}, path='{}'", new_ino, full_path);
+                debug!(
+                    "Successfully created file: ino={}, path='{}'",
+                    new_ino, full_path
+                );
 
                 // Reply with the new attributes, generation 0, file handle 0, and no special flags
                 reply.created(&TTL, &attr, 0, 0, 0);
@@ -343,7 +544,9 @@ impl Filesystem for RemoteFs {
         // 1. Find the file's path using the inode
         let path = {
             let path_map = self.path_to_inode.lock().unwrap();
-            path_map.iter().find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
+            path_map
+                .iter()
+                .find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
         };
 
         let file_path = match path {
@@ -357,7 +560,12 @@ impl Filesystem for RemoteFs {
         let api_path = file_path.trim_start_matches('/');
 
         // 2. Send the chunk of bytes to the server
-        match self.runtime.block_on(api::write_file(&self.server_addr, api_path, data, offset as u64)) {
+        match self.runtime.block_on(api::write_file(
+            &self.server_addr,
+            api_path,
+            data,
+            offset as u64,
+        )) {
             Ok(_) => {
                 // 3. Update the file size in our local cache so `ls` shows the correct size
                 let mut inode_map = self.inode_map.lock().unwrap();
@@ -401,7 +609,9 @@ impl Filesystem for RemoteFs {
         // 1. Resolve path (needed in case we are truncating the file to 0 bytes)
         let path = {
             let path_map = self.path_to_inode.lock().unwrap();
-            path_map.iter().find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
+            path_map
+                .iter()
+                .find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
         };
 
         // If the OS wants to truncate the file to 0 bytes, we tell the server to create an empty file over it.
@@ -409,7 +619,9 @@ impl Filesystem for RemoteFs {
             if s == 0 {
                 if let Some(ref p) = path {
                     let api_path = p.trim_start_matches('/');
-                    let _ = self.runtime.block_on(api::create_file(&self.server_addr, api_path));
+                    let _ = self
+                        .runtime
+                        .block_on(api::create_file(&self.server_addr, api_path));
                 }
             }
         }
@@ -421,9 +633,15 @@ impl Filesystem for RemoteFs {
                 attr.size = s;
                 attr.blocks = (s + 511) / 512;
             }
-            if let Some(m) = mode { attr.perm = m as u16; }
-            if let Some(u) = uid { attr.uid = u; }
-            if let Some(g) = gid { attr.gid = g; }
+            if let Some(m) = mode {
+                attr.perm = m as u16;
+            }
+            if let Some(u) = uid {
+                attr.uid = u;
+            }
+            if let Some(g) = gid {
+                attr.gid = g;
+            }
 
             attr.mtime = SystemTime::now();
 
@@ -432,7 +650,7 @@ impl Filesystem for RemoteFs {
             reply.error(ENOENT);
         }
     }
-    
+
     fn read(
         &mut self,
         _req: &Request,
@@ -449,7 +667,8 @@ impl Filesystem for RemoteFs {
         // 1. Find the path associated with this inode
         let path = {
             let path_map = self.path_to_inode.lock().unwrap();
-            path_map.iter()
+            path_map
+                .iter()
                 .find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
         };
         let file_path = match path {
@@ -464,7 +683,10 @@ impl Filesystem for RemoteFs {
         let api_path = file_path.trim_start_matches('/');
 
         // 2. Fetch the file content from the server
-        match self.runtime.block_on(api::read_file(&self.server_addr, api_path)) {
+        match self
+            .runtime
+            .block_on(api::read_file(&self.server_addr, api_path))
+        {
             Ok(bytes) => {
                 // 3. Slice the data based on offset and size requested by the kernel
                 let start = offset as usize;
@@ -481,6 +703,143 @@ impl Filesystem for RemoteFs {
             Err(err) => {
                 error!("Failed to read file {} from server: {:?}", api_path, err);
                 reply.error(libc::EIO); // I/O Error
+            }
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        // Resolve the file path, ask the server to delete it, then clear the local cache.
+        let full_path = match self.child_path(parent, name) {
+            Ok(path) => path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+
+        debug!("unlink(parent={}, path='{}')", parent, full_path);
+
+        // `unlink` must reject directories; those should go through `rmdir`.
+        if let Some(ino) = self.path_to_inode.lock().unwrap().get(&full_path).copied() {
+            if let Some(attr) = self.inode_map.lock().unwrap().get(&ino) {
+                if attr.kind == FileType::Directory {
+                    reply.error(libc::EISDIR);
+                    return;
+                }
+            }
+        }
+
+        let api_path = full_path.trim_start_matches('/');
+        match self
+            .runtime
+            .block_on(api::delete_file(&self.server_addr, api_path))
+        {
+            Ok(_) => {
+                self.remove_cached_path(&full_path);
+                reply.ok();
+            }
+            Err(err) => {
+                error!("Failed to delete file {} on server: {:?}", api_path, err);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        // Resolve the directory path, ask the server to delete it, then clear cached children.
+        let full_path = match self.child_path(parent, name) {
+            Ok(path) => path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+
+        debug!("rmdir(parent={}, path='{}')", parent, full_path);
+
+        // `rmdir` must reject regular files; those should go through `unlink`.
+        if let Some(ino) = self.path_to_inode.lock().unwrap().get(&full_path).copied() {
+            if let Some(attr) = self.inode_map.lock().unwrap().get(&ino) {
+                if attr.kind != FileType::Directory {
+                    reply.error(libc::ENOTDIR);
+                    return;
+                }
+            }
+        }
+
+        let api_path = full_path.trim_start_matches('/');
+        match self
+            .runtime
+            .block_on(api::delete_file(&self.server_addr, api_path))
+        {
+            Ok(_) => {
+                self.remove_cached_path(&full_path);
+                reply.ok();
+            }
+            Err(err) => {
+                error!(
+                    "Failed to delete directory {} on server: {:?}",
+                    api_path, err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        // This implementation only handles normal rename semantics.
+        if flags != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        // Resolve both paths, send the move to the server, then update cached paths locally.
+        let from_path = match self.resolve_rename_source_path(parent, name, newname) {
+            Ok(path) => path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+        let to_path = match self.child_path(newparent, newname) {
+            Ok(path) => path,
+            Err(err) => {
+                reply.error(err);
+                return;
+            }
+        };
+
+        debug!(
+            "rename(parent={}, raw_name={:?}, resolved_name='{}', newparent={}, raw_newname={:?}, resolved_newname='{}', flags={})",
+            parent, name, from_path, newparent, newname, to_path, flags
+        );
+
+        let api_from = from_path.trim_start_matches('/');
+        let api_to = to_path.trim_start_matches('/');
+
+        match self
+            .runtime
+            .block_on(api::rename_file(&self.server_addr, api_from, api_to))
+        {
+            Ok(_) => {
+                self.rename_cached_path(&from_path, &to_path);
+                reply.ok();
+            }
+            Err(err) => {
+                error!(
+                    "Failed to rename {} to {} on server: {:?}",
+                    api_from, api_to, err
+                );
+                reply.error(libc::EIO);
             }
         }
     }
@@ -503,10 +862,16 @@ impl Filesystem for RemoteFs {
             // Try to find path by ino for non-root.
             // This is a simple reverse lookup; a more robust system might be needed.
             let path_map = self.path_to_inode.lock().unwrap();
-            if let Some(p) = path_map.iter().find_map(|(p_str, &i)| if i == ino { Some(p_str.clone()) } else { None }) {
+            if let Some(p) = path_map
+                .iter()
+                .find_map(|(p_str, &i)| if i == ino { Some(p_str.clone()) } else { None })
+            {
                 p
             } else {
-                error!("readdir: Could not find path for ino {}. Replying ENOENT.", ino);
+                error!(
+                    "readdir: Could not find path for ino {}. Replying ENOENT.",
+                    ino
+                );
                 reply.error(ENOENT);
                 return;
             }
@@ -517,7 +882,6 @@ impl Filesystem for RemoteFs {
         } else {
             current_path.trim_start_matches('/').to_string()
         };
-
 
         let mut entries_for_reply: Vec<(u64, FileType, String)> = Vec::new();
 
@@ -535,11 +899,19 @@ impl Filesystem for RemoteFs {
             *path_map.get(&parent_path_str).unwrap_or(&FUSE_ROOT_ID)
         };
         entries_for_reply.push((parent_ino_for_dotdot, FileType::Directory, "..".to_string()));
-        
-        if offset < entries_for_reply.len() as i64 { // Only fetch from server if we haven't passed ., ..
-            match self.runtime.block_on(api::list_directory(&self.server_addr, &api_path)) {
+
+        if offset < entries_for_reply.len() as i64 {
+            // Only fetch from server if we haven't passed ., ..
+            match self
+                .runtime
+                .block_on(api::list_directory(&self.server_addr, &api_path))
+            {
                 Ok(api_entries) => {
-                    debug!("Successfully listed '{}' from server. Found {} entries.", api_path, api_entries.len());
+                    debug!(
+                        "Successfully listed '{}' from server. Found {} entries.",
+                        api_path,
+                        api_entries.len()
+                    );
                     let mut inode_map_locked = self.inode_map.lock().unwrap();
                     let mut path_to_inode_locked = self.path_to_inode.lock().unwrap();
                     let mut next_inode_locked = self.next_inode.lock().unwrap();
@@ -553,40 +925,59 @@ impl Filesystem for RemoteFs {
                             format!("{}/{}", current_path.trim_end_matches('/'), file_name)
                         };
 
-                        let (entry_ino, entry_kind) = if let Some(&existing_ino) = path_to_inode_locked.get(&full_entry_path) {
+                        let (entry_ino, entry_kind) = if let Some(&existing_ino) =
+                            path_to_inode_locked.get(&full_entry_path)
+                        {
                             let attr = inode_map_locked.get_mut(&existing_ino).unwrap(); // Should exist
                             attr.size = api_entry.size;
                             (existing_ino, attr.kind)
                         } else {
                             let new_ino = *next_inode_locked;
                             *next_inode_locked += 1;
-                            let kind = if api_entry.type_ == "directory" { FileType::Directory } else { FileType::RegularFile };
-                            let perm = if kind == FileType::Directory { 0o755 } else { 0o644 };
+                            let kind = if api_entry.type_ == "directory" {
+                                FileType::Directory
+                            } else {
+                                FileType::RegularFile
+                            };
+                            let perm = if kind == FileType::Directory {
+                                0o755
+                            } else {
+                                0o644
+                            };
                             let attr = create_file_attr(new_ino, kind, api_entry.size, perm);
-                            
+
                             inode_map_locked.insert(new_ino, attr);
                             path_to_inode_locked.insert(full_entry_path.clone(), new_ino);
-                            debug!("Added new entry to maps: ino={}, path='{}', type={:?}", new_ino, full_entry_path, kind);
+                            debug!(
+                                "Added new entry to maps: ino={}, path='{}', type={:?}",
+                                new_ino, full_entry_path, kind
+                            );
                             (new_ino, kind)
                         };
                         entries_for_reply.push((entry_ino, entry_kind, file_name));
                     }
                 }
                 Err(err) => {
-                    error!("Failed to list directory {} from server: {:?}", api_path, err);
+                    error!(
+                        "Failed to list directory {} from server: {:?}",
+                        api_path, err
+                    );
                     reply.error(ENOENT);
                     return;
                 }
             }
         }
-        
+
         for (i, entry) in entries_for_reply.iter().enumerate().skip(offset as usize) {
             let (entry_ino, entry_ftype, ref entry_name) = *entry;
-            let entry_offset = (i + 1) as i64; 
-            debug!("Adding to reply: ino={}, offset={}, type={:?}, name='{}'", entry_ino, entry_offset, entry_ftype, entry_name);
+            let entry_offset = (i + 1) as i64;
+            debug!(
+                "Adding to reply: ino={}, offset={}, type={:?}, name='{}'",
+                entry_ino, entry_offset, entry_ftype, entry_name
+            );
             if reply.add(entry_ino, entry_offset, entry_ftype, entry_name) {
                 debug!("Reply buffer full after adding ino {}.", entry_ino);
-                break; 
+                break;
             }
         }
         reply.ok();
