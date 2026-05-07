@@ -1,30 +1,93 @@
 // This is a server for a remote file system.
 // It provides a basic REST API for listing, reading, writing, creating,
-// deleting, and renaming files/directories in an in-memory mock store.
+// deleting, and renaming files/directories under a configured local root.
 //
-// To run the server, navigate to the `server` directory
-// and run the command: `cargo run`
+// To run the server, navigate to the project root and run:
+// `cargo run -p server -- [STORAGE_ROOT]`
 //
 // The server will listen on `0.0.0.0:3000`.
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::{
+    env, io,
+    io::SeekFrom,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    fs::{self, OpenOptions},
+    io::{AsyncSeekExt, AsyncWriteExt},
+};
 
-const MOCK_TIMESTAMP: &str = "2024-05-23T12:00:00Z";
+const DEFAULT_STORAGE_ROOT: &str = "remote-storage";
 
 struct AppState {
-    file_contents: Mutex<HashMap<String, Vec<u8>>>,
-    directories: Mutex<HashSet<String>>,
+    root_dir: PathBuf,
+}
+
+impl AppState {
+    fn new(root_dir: PathBuf) -> Self {
+        AppState { root_dir }
+    }
+
+    // Resolves an API path below the storage root and rejects traversal like `..`.
+    fn resolve_path(&self, path: &str) -> Result<PathBuf, StorageError> {
+        let relative_path = sanitize_api_path(path)?;
+        Ok(self.root_dir.join(relative_path))
+    }
+
+    // Same as `resolve_path`, but rejects the root path for mutating endpoints.
+    fn resolve_non_root_path(&self, path: &str) -> Result<PathBuf, StorageError> {
+        let relative_path = sanitize_api_path(path)?;
+
+        if relative_path.as_os_str().is_empty() {
+            return Err(StorageError::BadRequest("Path cannot be empty"));
+        }
+
+        Ok(self.root_dir.join(relative_path))
+    }
+}
+
+#[derive(Debug)]
+enum StorageError {
+    BadRequest(&'static str),
+    NotFound(&'static str),
+    Conflict(&'static str),
+    Io(io::Error),
+}
+
+impl StorageError {
+    fn from_io(error: io::Error, not_found_message: &'static str) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound => StorageError::NotFound(not_found_message),
+            io::ErrorKind::AlreadyExists => StorageError::Conflict("Path already exists"),
+            _ => StorageError::Io(error),
+        }
+    }
+}
+
+impl IntoResponse for StorageError {
+    fn into_response(self) -> Response {
+        match self {
+            StorageError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+            StorageError::NotFound(message) => (StatusCode::NOT_FOUND, message).into_response(),
+            StorageError::Conflict(message) => (StatusCode::CONFLICT, message).into_response(),
+            StorageError::Io(error) => {
+                eprintln!("Storage error: {error}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Storage error").into_response()
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -43,99 +106,95 @@ struct DirectoryEntry {
     modified_at: String,
 }
 
-// Converts API paths to the internal format: no leading/trailing slashes.
-fn normalize_path(path: &str) -> String {
-    path.trim_matches('/').to_string()
-}
+// Converts API paths to a safe relative filesystem path.
+fn sanitize_api_path(path: &str) -> Result<PathBuf, StorageError> {
+    let trimmed_path = path.trim_matches('/');
+    let mut relative_path = PathBuf::new();
 
-// Returns the parent directory path, or "" when the parent is root.
-fn parent_path(path: &str) -> String {
-    match path.rsplit_once('/') {
-        Some((parent, _)) => parent.to_string(),
-        None => String::new(),
+    if trimmed_path.is_empty() {
+        return Ok(relative_path);
     }
-}
 
-// Adds every parent segment of a path to the in-memory directory set.
-fn ensure_parent_directories(directories: &mut HashSet<String>, path: &str) {
-    let mut current = String::new();
-
-    for part in path.split('/').filter(|part| !part.is_empty()) {
-        if current.is_empty() {
-            current.push_str(part);
-        } else {
-            current.push('/');
-            current.push_str(part);
+    for component in Path::new(trimmed_path).components() {
+        match component {
+            Component::Normal(part) => relative_path.push(part),
+            _ => return Err(StorageError::BadRequest("Invalid path")),
         }
-        directories.insert(current.clone());
     }
+
+    Ok(relative_path)
 }
 
-// Returns child's basename only when it is directly inside parent.
-fn is_direct_child(parent: &str, child: &str) -> Option<String> {
-    if parent.is_empty() {
-        if child.is_empty() || child.contains('/') {
-            None
-        } else {
-            Some(child.to_string())
-        }
+// Formats modification time as seconds since the Unix epoch.
+fn format_modified_at(modified_at: SystemTime) -> String {
+    modified_at
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+// Builds the JSON entry returned by the directory listing endpoint.
+fn directory_entry_from_metadata(
+    name: String,
+    metadata: std::fs::Metadata,
+) -> Option<DirectoryEntry> {
+    let type_ = if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
     } else {
-        let prefix = format!("{}/", parent);
-        let child_tail = child.strip_prefix(&prefix)?;
+        return None;
+    };
 
-        if child_tail.is_empty() || child_tail.contains('/') {
-            None
+    Some(DirectoryEntry {
+        name,
+        type_: type_.to_string(),
+        size: if metadata.is_file() {
+            metadata.len()
         } else {
-            Some(child_tail.to_string())
-        }
-    }
+            0
+        },
+        modified_at: metadata
+            .modified()
+            .map(format_modified_at)
+            .unwrap_or_else(|_| "0".to_string()),
+    })
 }
 
-// Builds a directory listing from the current in-memory files and directories.
-fn list_entries(state: &AppState, path: &str) -> Vec<DirectoryEntry> {
-    let normalized_path = normalize_path(path);
-    let directories = state.directories.lock().unwrap();
-    let contents = state.file_contents.lock().unwrap();
+// Lists the immediate children of one directory on disk.
+async fn list_entries(state: &AppState, path: &str) -> Result<Vec<DirectoryEntry>, StorageError> {
+    let directory_path = state.resolve_path(path)?;
+    let metadata = fs::metadata(&directory_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Directory not found"))?;
+
+    if !metadata.is_dir() {
+        return Err(StorageError::BadRequest("Path is not a directory"));
+    }
+
+    let mut read_dir = fs::read_dir(&directory_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Directory not found"))?;
     let mut entries = Vec::new();
 
-    for directory in directories.iter() {
-        if directory == &normalized_path {
-            continue;
-        }
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not read directory"))?
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let metadata = entry
+            .metadata()
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not read entry"))?;
 
-        if let Some(name) = is_direct_child(&normalized_path, directory) {
-            entries.push(DirectoryEntry {
-                name,
-                type_: "directory".to_string(),
-                size: 0,
-                modified_at: MOCK_TIMESTAMP.to_string(),
-            });
-        }
-    }
-
-    for (file_path, data) in contents.iter() {
-        if let Some(name) = is_direct_child(&normalized_path, file_path) {
-            entries.push(DirectoryEntry {
-                name,
-                type_: "file".to_string(),
-                size: data.len() as u64,
-                modified_at: MOCK_TIMESTAMP.to_string(),
-            });
+        if let Some(directory_entry) = directory_entry_from_metadata(name, metadata) {
+            entries.push(directory_entry);
         }
     }
 
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    entries
-}
-
-// Maps a path from an old prefix to a new prefix during directory renames.
-fn rename_path(path: &str, from: &str, to: &str) -> Option<String> {
-    if path == from {
-        Some(to.to_string())
-    } else {
-        path.strip_prefix(&format!("{}/", from))
-            .map(|suffix| format!("{}/{}", to, suffix))
-    }
+    Ok(entries)
 }
 
 // Builds the Axum router with all file-system endpoints wired to shared state.
@@ -152,217 +211,200 @@ fn build_app(shared_state: Arc<AppState>) -> Router {
         .with_state(shared_state)
 }
 
-// Creates the initial mock filesystem contents used at server startup.
-fn initial_state() -> Arc<AppState> {
-    let mut initial_contents = HashMap::new();
-    initial_contents.insert(
-        "folder1/file1.txt".to_string(),
-        b"Hello from file1.txt!\n".to_vec(),
-    );
-    initial_contents.insert("image.jpg".to_string(), b"Fake image data...".to_vec());
-
-    let mut directories = HashSet::new();
-    directories.insert(String::new());
-    directories.insert("Documents".to_string());
-    directories.insert("folder1".to_string());
-
-    Arc::new(AppState {
-        file_contents: Mutex::new(initial_contents),
-        directories: Mutex::new(directories),
-    })
+// Reads the storage root from the first CLI argument, then env, then a default.
+fn configured_storage_root() -> PathBuf {
+    env::args()
+        .nth(1)
+        .or_else(|| env::var("REMOTE_FS_ROOT").ok())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_ROOT))
 }
 
-// Handler for `POST /mkdir/*path`: records a new directory in memory.
+// Handler for `POST /mkdir/*path`: creates a directory on disk.
 async fn make_directory(
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let normalized_path = normalize_path(&path);
-    println!("Mock Server: Creating directory at /{}", normalized_path);
+) -> Result<impl IntoResponse, StorageError> {
+    let directory_path = state.resolve_non_root_path(&path)?;
+    println!("Server: Creating directory at /{}", path.trim_matches('/'));
 
-    if normalized_path.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Directory path cannot be empty").into_response();
-    }
+    fs::create_dir(&directory_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Parent directory not found"))?;
 
-    let parent = parent_path(&normalized_path);
-    let mut directories = state.directories.lock().unwrap();
-
-    if !directories.contains(&parent) {
-        return (StatusCode::NOT_FOUND, "Parent directory not found").into_response();
-    }
-
-    directories.insert(normalized_path.clone());
-    (
+    Ok((
         StatusCode::CREATED,
-        format!("Directory {} created", normalized_path),
-    )
-        .into_response()
+        format!("Directory {} created", path.trim_matches('/')),
+    ))
 }
 
 // Handler for `GET /files/*path`: returns the stored bytes for a file.
 async fn get_file(
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let normalized_path = normalize_path(&path);
-    let contents = state.file_contents.lock().unwrap();
+) -> Result<impl IntoResponse, StorageError> {
+    let file_path = state.resolve_non_root_path(&path)?;
+    let metadata = fs::metadata(&file_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "File not found"))?;
 
-    if let Some(data) = contents.get(&normalized_path) {
-        (StatusCode::OK, data.clone()).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "File not found".to_string()).into_response()
+    if !metadata.is_file() {
+        return Err(StorageError::BadRequest("Path is not a file"));
     }
+
+    let data = fs::read(&file_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "File not found"))?;
+
+    Ok((StatusCode::OK, data))
 }
 
 // Handler for `PUT /files/*path`: writes a byte chunk at the requested offset.
 async fn write_file(
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     body: Bytes,
-) -> impl IntoResponse {
-    let normalized_path = normalize_path(&path);
-    let offset: usize = headers
+) -> Result<impl IntoResponse, StorageError> {
+    let file_path = state.resolve_non_root_path(&path)?;
+    let offset: u64 = headers
         .get("X-File-Offset")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
     println!(
-        "Mock Server: Received {} byte for /{} (offset: {})",
+        "Server: Received {} byte for /{} (offset: {})",
         body.len(),
-        normalized_path,
+        path.trim_matches('/'),
         offset
     );
 
-    {
-        let mut directories = state.directories.lock().unwrap();
-        ensure_parent_directories(&mut directories, &parent_path(&normalized_path));
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not create parent directory"))?;
     }
 
-    let mut contents = state.file_contents.lock().unwrap();
-    let file_data = contents.entry(normalized_path).or_insert_with(Vec::new);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not open file"))?;
 
-    if file_data.len() < offset + body.len() {
-        file_data.resize(offset + body.len(), 0);
+    if offset == 0 && body.is_empty() {
+        file.set_len(0)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not truncate file"))?;
+        return Ok(StatusCode::OK);
     }
 
-    file_data[offset..offset + body.len()].copy_from_slice(&body);
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not seek file"))?;
+    file.write_all(&body)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
+    file.flush()
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not flush file"))?;
 
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK)
 }
 
 // Handler for `DELETE /files/*path`: removes a file or a full directory tree.
 async fn delete_path(
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let normalized_path = normalize_path(&path);
+) -> Result<impl IntoResponse, StorageError> {
+    let target_path = state.resolve_non_root_path(&path)?;
+    let metadata = fs::metadata(&target_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Path not found"))?;
 
-    if normalized_path.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Cannot delete root").into_response();
-    }
-
-    let mut directories = state.directories.lock().unwrap();
-    let mut contents = state.file_contents.lock().unwrap();
-    let mut deleted = contents.remove(&normalized_path).is_some();
-
-    if directories.remove(&normalized_path) {
-        deleted = true;
-        let prefix = format!("{}/", normalized_path);
-        directories.retain(|dir| !dir.starts_with(&prefix));
-        contents.retain(|file_path, _| !file_path.starts_with(&prefix));
-    }
-
-    if deleted {
-        StatusCode::NO_CONTENT.into_response()
+    if metadata.is_dir() {
+        fs::remove_dir_all(&target_path)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not remove directory"))?;
     } else {
-        (StatusCode::NOT_FOUND, "Path not found").into_response()
+        fs::remove_file(&target_path)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not remove file"))?;
     }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // Handler for `POST /rename`: moves/renames files or directory trees.
 async fn rename_entry(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RenameRequest>,
-) -> impl IntoResponse {
-    let from = normalize_path(&payload.from);
-    let to = normalize_path(&payload.to);
+) -> Result<impl IntoResponse, StorageError> {
+    let from_path = state.resolve_non_root_path(&payload.from)?;
+    let to_path = state.resolve_non_root_path(&payload.to)?;
+    let from_metadata = fs::metadata(&from_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Source path not found"))?;
 
-    if from.is_empty() || to.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Rename paths cannot be empty").into_response();
+    if from_metadata.is_dir() && to_path.starts_with(&from_path) {
+        return Err(StorageError::BadRequest(
+            "Cannot move a directory inside itself",
+        ));
     }
 
-    {
-        let mut directories = state.directories.lock().unwrap();
-        ensure_parent_directories(&mut directories, &parent_path(&to));
+    if let Some(parent) = to_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not create parent directory"))?;
     }
 
-    let mut directories = state.directories.lock().unwrap();
-    let mut contents = state.file_contents.lock().unwrap();
-    let mut renamed = false;
-
-    if !contents.contains_key(&from) && !directories.contains(&from) {
-        return (StatusCode::NOT_FOUND, "Source path not found").into_response();
-    }
-
-    let to_prefix = format!("{}/", to);
-    contents.remove(&to);
-    contents.retain(|path, _| !path.starts_with(&to_prefix));
-    directories.remove(&to);
-    directories.retain(|dir| !dir.starts_with(&to_prefix));
-
-    if let Some(data) = contents.remove(&from) {
-        contents.insert(to.clone(), data);
-        renamed = true;
-    }
-
-    if directories.contains(&from) {
-        let old_directories: Vec<String> = directories.iter().cloned().collect();
-        let old_files: Vec<(String, Vec<u8>)> = contents
-            .iter()
-            .map(|(path, data)| (path.clone(), data.clone()))
-            .collect();
-
-        directories.retain(|dir| rename_path(dir, &from, &to).is_none());
-        for dir in old_directories {
-            if let Some(new_path) = rename_path(&dir, &from, &to) {
-                directories.insert(new_path);
-            }
+    if let Ok(to_metadata) = fs::metadata(&to_path).await {
+        if to_metadata.is_dir() {
+            fs::remove_dir_all(&to_path)
+                .await
+                .map_err(|error| StorageError::from_io(error, "Could not replace directory"))?;
+        } else {
+            fs::remove_file(&to_path)
+                .await
+                .map_err(|error| StorageError::from_io(error, "Could not replace file"))?;
         }
-
-        contents.retain(|path, _| rename_path(path, &from, &to).is_none());
-        for (path, data) in old_files {
-            if let Some(new_path) = rename_path(&path, &from, &to) {
-                contents.insert(new_path, data);
-            }
-        }
-
-        renamed = true;
     }
 
-    debug_assert!(renamed);
-    StatusCode::OK.into_response()
+    fs::rename(&from_path, &to_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not rename path"))?;
+
+    Ok(StatusCode::OK)
 }
 
 // Handler for `GET /list/`: lists the root directory.
-async fn list_root(State(state): State<Arc<AppState>>) -> Json<Vec<DirectoryEntry>> {
-    Json(list_entries(&state, ""))
+async fn list_root(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DirectoryEntry>>, StorageError> {
+    Ok(Json(list_entries(&state, "").await?))
 }
 
 // Handler for `GET /list/*path`: lists a specific directory.
 async fn list_path(
-    Path(path): Path<String>,
+    AxumPath(path): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> Json<Vec<DirectoryEntry>> {
-    Json(list_entries(&state, &path))
+) -> Result<Json<Vec<DirectoryEntry>>, StorageError> {
+    Ok(Json(list_entries(&state, &path).await?))
 }
 
 #[tokio::main]
 async fn main() {
-    let app = build_app(initial_state());
+    let storage_root = configured_storage_root();
+    std::fs::create_dir_all(&storage_root).expect("Failed to create storage root");
+    let storage_root =
+        std::fs::canonicalize(&storage_root).expect("Failed to resolve storage root");
+
+    let app = build_app(Arc::new(AppState::new(storage_root.clone())));
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    println!("Mock server listening on {}", addr);
+    println!("Server storage root: {}", storage_root.display());
+    println!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -376,23 +418,49 @@ mod tests {
         http::{Method, Request, StatusCode},
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
-    fn empty_state() -> Arc<AppState> {
-        let mut directories = HashSet::new();
-        directories.insert(String::new());
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-        Arc::new(AppState {
-            file_contents: Mutex::new(HashMap::new()),
-            directories: Mutex::new(directories),
-        })
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = env::temp_dir().join(format!(
+                "remote-fs-server-test-{}-{}-{}",
+                name,
+                std::process::id(),
+                counter
+            ));
+
+            std::fs::create_dir_all(&path).unwrap();
+            TestRoot { path }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.path.clone()
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn app_for_root(root: PathBuf) -> Router {
+        build_app(Arc::new(AppState::new(root)))
     }
 
     #[tokio::test]
     async fn test_file_chunked_upload() {
-        // 1. Start with an empty mock server state.
-        let shared_state = empty_state();
-        let app = build_app(shared_state.clone());
+        // 1. Start with an empty disk-backed server root.
+        let root = TestRoot::new("chunked-upload");
+        let app = app_for_root(root.path());
 
         // 2. Upload the first chunk at offset 0.
         let request_one = Request::builder()
@@ -416,19 +484,16 @@ mod tests {
         let response_two = app.oneshot(request_two).await.unwrap();
         assert_eq!(response_two.status(), StatusCode::OK);
 
-        // 4. Check that both chunks were stitched together in memory.
-        let contents = shared_state.file_contents.lock().unwrap();
-        let saved_file = contents
-            .get("test_upload.txt")
-            .expect("File was not created in memory!");
-
+        // 4. Check that both chunks were stitched together on disk.
+        let saved_file = std::fs::read(root.path.join("test_upload.txt")).unwrap();
         assert_eq!(saved_file, b"Hello World!");
     }
 
     #[tokio::test]
     async fn test_directory_listing_reflects_writes_and_mkdir() {
-        // 1. Start with an empty mock server state.
-        let app = build_app(empty_state());
+        // 1. Start with an empty disk-backed server root.
+        let root = TestRoot::new("listing");
+        let app = app_for_root(root.path());
 
         // 2. Create a directory through the API.
         let mkdir = Request::builder()
@@ -470,21 +535,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_removes_file_and_directory_tree() {
-        // 1. Seed a small directory tree directly in the mock state.
-        let shared_state = empty_state();
-        {
-            let mut directories = shared_state.directories.lock().unwrap();
-            directories.insert("docs".to_string());
-            directories.insert("docs/archive".to_string());
-        }
-        shared_state
-            .file_contents
-            .lock()
-            .unwrap()
-            .insert("docs/archive/old.txt".to_string(), b"old".to_vec());
+        // 1. Seed a small directory tree directly on disk.
+        let root = TestRoot::new("delete");
+        std::fs::create_dir_all(root.path.join("docs/archive")).unwrap();
+        std::fs::write(root.path.join("docs/archive/old.txt"), b"old").unwrap();
 
         // 2. Delete the tree through the API.
-        let app = build_app(shared_state.clone());
+        let app = app_for_root(root.path());
         let request = Request::builder()
             .method(Method::DELETE)
             .uri("/files/docs")
@@ -494,31 +551,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         // 3. Verify both the directory and its nested file are gone.
-        assert!(!shared_state.directories.lock().unwrap().contains("docs"));
-        assert!(!shared_state
-            .file_contents
-            .lock()
-            .unwrap()
-            .contains_key("docs/archive/old.txt"));
+        assert!(!root.path.join("docs").exists());
+        assert!(!root.path.join("docs/archive/old.txt").exists());
     }
 
     #[tokio::test]
     async fn test_rename_moves_directory_tree() {
-        // 1. Seed a directory tree directly in the mock state.
-        let shared_state = empty_state();
-        {
-            let mut directories = shared_state.directories.lock().unwrap();
-            directories.insert("docs".to_string());
-            directories.insert("docs/archive".to_string());
-        }
-        shared_state
-            .file_contents
-            .lock()
-            .unwrap()
-            .insert("docs/archive/old.txt".to_string(), b"old".to_vec());
+        // 1. Seed a directory tree directly on disk.
+        let root = TestRoot::new("rename");
+        std::fs::create_dir_all(root.path.join("docs/archive")).unwrap();
+        std::fs::write(root.path.join("docs/archive/old.txt"), b"old").unwrap();
 
         // 2. Rename the tree through the API.
-        let app = build_app(shared_state.clone());
+        let app = app_for_root(root.path());
         let request = Request::builder()
             .method(Method::POST)
             .uri("/rename")
@@ -531,20 +576,71 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // 3. Verify old paths disappeared and new paths contain the same data.
-        assert!(!shared_state.directories.lock().unwrap().contains("docs"));
-        assert!(shared_state
-            .directories
-            .lock()
-            .unwrap()
-            .contains("renamed/docs/archive"));
+        assert!(!root.path.join("docs").exists());
+        assert!(root.path.join("renamed/docs/archive").is_dir());
         assert_eq!(
-            shared_state
-                .file_contents
-                .lock()
-                .unwrap()
-                .get("renamed/docs/archive/old.txt")
-                .unwrap(),
+            std::fs::read(root.path.join("renamed/docs/archive/old.txt")).unwrap(),
             b"old"
         );
+    }
+
+    #[tokio::test]
+    async fn test_rename_rejects_moving_directory_inside_itself() {
+        // 1. Seed a directory tree directly on disk.
+        let root = TestRoot::new("rename-inside-self");
+        std::fs::create_dir_all(root.path.join("docs/archive")).unwrap();
+
+        // 2. Try to move the directory inside its own subtree.
+        let app = app_for_root(root.path());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/rename")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "from": "docs", "to": "docs/archive/docs" }).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // 3. Verify the original tree is still in place.
+        assert!(root.path.join("docs/archive").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_written_file_survives_new_router_with_same_root() {
+        // 1. Write a file through one router instance.
+        let root = TestRoot::new("persistence");
+        let app = app_for_root(root.path());
+        let write = Request::builder()
+            .method(Method::PUT)
+            .uri("/files/persistent.txt")
+            .body(Body::from("still here"))
+            .unwrap();
+        assert_eq!(app.oneshot(write).await.unwrap().status(), StatusCode::OK);
+
+        // 2. Build a fresh router and read the same file from disk.
+        let app = app_for_root(root.path());
+        let read = Request::builder()
+            .method(Method::GET)
+            .uri("/files/persistent.txt")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(read).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"still here");
+    }
+
+    #[test]
+    fn test_path_traversal_is_rejected() {
+        // 1. Build state with any root; validation should reject before disk access.
+        let root = TestRoot::new("path-validation");
+        let state = AppState::new(root.path());
+
+        // 2. Ensure parent-directory components cannot escape the storage root.
+        assert!(state.resolve_path("../Cargo.toml").is_err());
+        assert!(state.resolve_path("docs/../../Cargo.toml").is_err());
     }
 }

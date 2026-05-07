@@ -60,6 +60,29 @@ The server can be implemented using any language or framework, but should be RES
 
 - Graceful startup and shutdown procedures
 
+## Usage
+
+### Server
+
+First, start the server. The current Rust server stores files on local disk under a configured storage root. Pass it as the
+first server argument, set `REMOTE_FS_ROOT`, or let it default to `./remote-storage`:
+
+```sh
+cargo run -p server -- ./remote-storage
+```
+
+### Client
+
+In another terminal, create a mount point and start the client:
+
+```sh
+mkdir test_folder
+cargo run -p client -- test_folder http://127.0.0.1:3000
+```
+
+The mounted directory can then be used with normal file commands (from a third terminal) such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
+When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.
+
 ## Notes
 
 Logging (log::info!, log::debug!) is your friend during the development of a FUSE filesystem.
@@ -100,7 +123,7 @@ Logging (log::info!, log::debug!) is your friend during the development of a FUS
 
 ### Improvements
 
-- [ ] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
+- [x] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
 - [ ] Better file permission handling (currently hardcoded)
 - [ ] Proper file modification timestamps (currently `SystemTime::now()`)
 - [ ] Graceful shutdown with signal handling
