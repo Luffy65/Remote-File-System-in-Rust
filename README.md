@@ -22,8 +22,8 @@ This project aims to implement a remote file system client in Rust that presents
 - [x] Read files from the remote server
 - [x] Write modified files back to the remote server
 - [x] Support creation, deletion, and renaming of files and directories
-- [ ] Maintain file attributes such as size, timestamps, and permissions (as feasible)
-- [ ] Run as a background daemon process that handles filesystem operations continuously
+- [x] Maintain file attributes such as size, timestamps, and permissions (as feasible)
+- [x] Run as a background daemon process that handles filesystem operations continuously
 
 ### Server Interface and implementation
 
@@ -40,8 +40,8 @@ The server can be implemented using any language or framework, but should be RES
 
 ### Caching
 
-- Optional local caching layer for performance
-- Configurable cache invalidation strategy (e.g., TTL or LRU)
+- Optional local caching layer for performance, implemented in the client with a TTL/LRU directory cache
+- Configurable cache invalidation strategy (TTL plus LRU eviction)
 
 ## Non-Functional Requirements
 
@@ -125,8 +125,8 @@ Logging (log::info!, log::debug!) is your friend during the development of a FUS
 ### Improvements
 
 - [x] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
-- [ ] Better file permission handling (currently hardcoded)
-- [ ] Proper file modification timestamps (modified_at) (currently we have `SystemTime::now()`)
-- [ ] Graceful shutdown with signal handling
-- [ ] File handle tracking for proper resource management
+- [x] Better file permission handling (currently hardcoded)
+- [x] Proper file modification timestamps (modified_at) (currently we have `SystemTime::now()`)
+- [x] Graceful shutdown with signal handling
+- [x] File handle tracking for proper resource management
 - [ ] Better error handling and logging

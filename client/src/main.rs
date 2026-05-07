@@ -9,6 +9,30 @@ use std::env;
 
 // The RemoteFs struct and its Filesystem impl are now in fuse.rs
 
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => log::info!("Shutdown requested with Ctrl-C."),
+        _ = terminate => log::info!("Shutdown requested with SIGTERM."),
+    }
+}
+
 fn main() {
     env_logger::init(); // Initialize logger
 
@@ -42,18 +66,23 @@ fn main() {
     // Correct instantiation based on client/src/fuse.rs RemoteFs::new which does not return a Result
     let fs = fuse::RemoteFs::new(&server_url);
 
-    match fuser::mount2(fs, mountpoint, &options) {
-        Ok(_) => {
-            log::info!(
-                "Filesystem mounted successfully on {}. Press Ctrl-C to unmount.",
-                mountpoint
-            );
-            // mount2 blocks until unmounted, so nothing more to do here for a simple client.
-            // For a more complex application, you might join a thread or handle signals.
-        }
+    let session = match fuser::spawn_mount2(fs, mountpoint, &options) {
+        Ok(session) => session,
         Err(e) => {
             log::error!("Failed to mount filesystem: {}", e);
             std::process::exit(1);
         }
-    }
+    };
+
+    log::info!(
+        "Filesystem mounted successfully on {}. Press Ctrl-C to unmount.",
+        mountpoint
+    );
+
+    let shutdown_runtime =
+        tokio::runtime::Runtime::new().expect("Failed to create shutdown runtime");
+    shutdown_runtime.block_on(wait_for_shutdown_signal());
+
+    log::info!("Unmounting filesystem from {}", mountpoint);
+    let _ = session.join();
 }

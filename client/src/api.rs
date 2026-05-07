@@ -1,15 +1,61 @@
 use log;
 use reqwest;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     pub name: String,
     #[serde(rename = "type")]
     pub type_: String,
     pub size: u64,
-    #[allow(dead_code)]
     pub modified_at: String,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RemoteMetadata {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub size: u64,
+    pub modified_at: String,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+fn unix_seconds_from_system_time(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
+fn add_optional_metadata_headers(
+    mut request: reqwest::RequestBuilder,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    modified_at: Option<SystemTime>,
+) -> reqwest::RequestBuilder {
+    if let Some(mode) = mode {
+        request = request.header("X-File-Mode", format!("{:o}", mode & 0o7777));
+    }
+    if let Some(uid) = uid {
+        request = request.header("X-File-Uid", uid.to_string());
+    }
+    if let Some(gid) = gid {
+        request = request.header("X-File-Gid", gid.to_string());
+    }
+    if let Some(modified_at) = modified_at {
+        request = request.header(
+            "X-File-Mtime",
+            unix_seconds_from_system_time(modified_at).to_string(),
+        );
+    }
+
+    request
 }
 
 pub async fn list_directory(
@@ -30,22 +76,11 @@ pub async fn list_directory(
     let response = reqwest::get(&request_url).await?;
     log::debug!("Received response: {:?}", response.status());
 
-    if response.status().is_success() {
-        let entries = response.json::<Vec<DirectoryEntry>>().await?;
-        Ok(entries)
-    } else {
-        let status = response.status();
-        let err_msg = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        log::error!("Error fetching directory list: {} - {}", status, err_msg);
-        // Return an error by making a failing request to get a proper reqwest::Error
-        reqwest::get("http://invalid-non-existent-server-domain-12345")
-            .await
-            .map(|_| vec![])
-            .map_err(|e| e)
-    }
+    let entries = response
+        .error_for_status()?
+        .json::<Vec<DirectoryEntry>>()
+        .await?;
+    Ok(entries)
 }
 
 // Requests only one byte range from the server instead of downloading the whole file.
@@ -79,25 +114,35 @@ pub async fn read_file(
     Ok(bytes.to_vec())
 }
 
-pub async fn create_directory(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+pub async fn create_directory(
+    base_url: &str,
+    path: &str,
+    mode: u32,
+) -> Result<RemoteMetadata, reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
 
     let request_url = format!("{}/mkdir/{}", normalized_base, normalized_path);
     log::debug!("Requesting directory creation: POST {}", request_url);
 
-    // Create a reqwest client to send the POST request
     let client = reqwest::Client::new();
-    let response = client.post(&request_url).send().await?;
+    let response =
+        add_optional_metadata_headers(client.post(&request_url), Some(mode), None, None, None)
+            .send()
+            .await?;
 
-    // If the server returns an error (like 404 or 500), this turns it into a Rust Error
-    response.error_for_status()?;
-
-    Ok(())
+    Ok(response
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await?)
 }
 
 // Sends an empty file to the server
-pub async fn create_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+pub async fn create_file(
+    base_url: &str,
+    path: &str,
+    mode: u32,
+) -> Result<RemoteMetadata, reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
     let request_url = format!("{}/files/{}", normalized_base, normalized_path);
@@ -105,15 +150,18 @@ pub async fn create_file(base_url: &str, path: &str) -> Result<(), reqwest::Erro
     log::debug!("API: Creating new empty file via PUT {}", request_url);
 
     let client = reqwest::Client::new();
-    let response = client
+    let request = client
         .put(&request_url)
         .header("X-File-Offset", "0")
-        .body(vec![]) // Empty body to initialize the file
+        .body(vec![]);
+    let response = add_optional_metadata_headers(request, Some(mode), None, None, None)
         .send()
         .await?;
 
-    response.error_for_status()?;
-    Ok(())
+    Ok(response
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await?)
 }
 
 // Sends a chunk of bytes to the server at a specific offset
@@ -122,7 +170,7 @@ pub async fn write_file(
     path: &str,
     data: &[u8],
     offset: u64,
-) -> Result<(), reqwest::Error> {
+) -> Result<RemoteMetadata, reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
     let request_url = format!("{}/files/{}", normalized_base, normalized_path);
@@ -142,12 +190,18 @@ pub async fn write_file(
         .send()
         .await?;
 
-    response.error_for_status()?;
-    Ok(())
+    Ok(response
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await?)
 }
 
 // Asks the server to resize a file without sending file contents.
-pub async fn resize_file(base_url: &str, path: &str, size: u64) -> Result<(), reqwest::Error> {
+pub async fn resize_file(
+    base_url: &str,
+    path: &str,
+    size: u64,
+) -> Result<RemoteMetadata, reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
     let request_url = format!("{}/files/{}", normalized_base, normalized_path);
@@ -162,8 +216,36 @@ pub async fn resize_file(base_url: &str, path: &str, size: u64) -> Result<(), re
         .send()
         .await?;
 
-    response.error_for_status()?;
-    Ok(())
+    Ok(response
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await?)
+}
+
+pub async fn update_metadata(
+    base_url: &str,
+    path: &str,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    modified_at: Option<SystemTime>,
+) -> Result<RemoteMetadata, reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let request_url = format!("{}/metadata/{}", normalized_base, normalized_path);
+
+    log::debug!("API: Updating metadata for {}", request_url);
+
+    let client = reqwest::Client::new();
+    let response =
+        add_optional_metadata_headers(client.patch(&request_url), mode, uid, gid, modified_at)
+            .send()
+            .await?;
+
+    Ok(response
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await?)
 }
 
 pub async fn delete_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
