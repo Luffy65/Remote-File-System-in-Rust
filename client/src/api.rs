@@ -8,6 +8,7 @@ pub struct DirectoryEntry {
     #[serde(rename = "type")]
     pub type_: String,
     pub size: u64,
+    #[allow(dead_code)]
     pub modified_at: String,
 }
 
@@ -47,20 +48,32 @@ pub async fn list_directory(
     }
 }
 
-pub async fn read_file(base_url: &str, path: &str) -> Result<Vec<u8>, reqwest::Error> {
-    // Normalize paths
+// Requests only one byte range from the server instead of downloading the whole file.
+pub async fn read_file(
+    base_url: &str,
+    path: &str,
+    offset: u64,
+    size: u32,
+) -> Result<Vec<u8>, reqwest::Error> {
     let normalized_base_url = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
-
-    // Construct the endpoint for file reading
     let request_url = format!("{}/files/{}", normalized_base_url, normalized_path);
 
-    log::debug!("Requesting file content from URL: {}", request_url);
+    log::debug!(
+        "Requesting file range from URL: {} (offset={}, size={})",
+        request_url,
+        offset,
+        size
+    );
 
-    // Fetch the response and automatically convert HTTP errors (like 404) into reqwest::Error
-    let response = reqwest::get(&request_url).await?.error_for_status()?;
-
-    // Read the body as bytes
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&request_url)
+        .header("X-File-Offset", offset.to_string())
+        .header("X-File-Size", size.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
 
     Ok(bytes.to_vec())
@@ -126,6 +139,26 @@ pub async fn write_file(
         .put(&request_url)
         .header("X-File-Offset", offset.to_string())
         .body(data.to_vec())
+        .send()
+        .await?;
+
+    response.error_for_status()?;
+    Ok(())
+}
+
+// Asks the server to resize a file without sending file contents.
+pub async fn resize_file(base_url: &str, path: &str, size: u64) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+
+    log::debug!("API: Resizing {} to {} bytes", request_url, size);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(&request_url)
+        .header("X-File-Truncate", size.to_string())
+        .body(vec![])
         .send()
         .await?;
 

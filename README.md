@@ -101,10 +101,11 @@ Logging (log::info!, log::debug!) is your friend during the development of a FUS
 ### Client API Functions
 
 - [x] `list_directory()` – Send directory listing requests
-- [x] `read_file()` – Send file read requests
+- [x] `read_file()` – Send byte-range file read requests
 - [x] `create_file()` – Send empty file creation requests
 - [x] `create_directory()` – Send directory creation requests
 - [x] `write_file()` – Send file write requests
+- [x] `resize_file()` – Send file resize requests
 - [x] `delete_file()` – Send file delete requests
 - [x] `rename_file()` – Send file rename requests
 
@@ -125,7 +126,7 @@ Logging (log::info!, log::debug!) is your friend during the development of a FUS
 
 - [x] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
 - [ ] Better file permission handling (currently hardcoded)
-- [ ] Proper file modification timestamps (currently `SystemTime::now()`)
+- [ ] Proper file modification timestamps (modified_at) (currently we have `SystemTime::now()`)
 - [ ] Graceful shutdown with signal handling
 - [ ] File handle tracking for proper resource management
 - [ ] Better error handling and logging

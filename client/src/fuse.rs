@@ -614,14 +614,17 @@ impl Filesystem for RemoteFs {
                 .find_map(|(p, &i)| if i == ino { Some(p.clone()) } else { None })
         };
 
-        // If the OS wants to truncate the file to 0 bytes, we tell the server to create an empty file over it.
+        // If the OS resizes a file, mirror that size change on the server.
         if let Some(s) = size {
-            if s == 0 {
-                if let Some(ref p) = path {
-                    let api_path = p.trim_start_matches('/');
-                    let _ = self
-                        .runtime
-                        .block_on(api::create_file(&self.server_addr, api_path));
+            if let Some(ref p) = path {
+                let api_path = p.trim_start_matches('/');
+                if let Err(err) =
+                    self.runtime
+                        .block_on(api::resize_file(&self.server_addr, api_path, s))
+                {
+                    error!("Failed to resize file {} on server: {:?}", api_path, err);
+                    reply.error(libc::EIO);
+                    return;
                 }
             }
         }
@@ -664,6 +667,11 @@ impl Filesystem for RemoteFs {
     ) {
         debug!("read(ino={}, offset={}, size={})", ino, offset, size);
 
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
         // 1. Find the path associated with this inode
         let path = {
             let path_map = self.path_to_inode.lock().unwrap();
@@ -682,23 +690,15 @@ impl Filesystem for RemoteFs {
         // Clean up the path for the API (remove leading slash)
         let api_path = file_path.trim_start_matches('/');
 
-        // 2. Fetch the file content from the server
-        match self
-            .runtime
-            .block_on(api::read_file(&self.server_addr, api_path))
-        {
+        // 2. Fetch only the byte range requested by the kernel.
+        match self.runtime.block_on(api::read_file(
+            &self.server_addr,
+            api_path,
+            offset as u64,
+            size,
+        )) {
             Ok(bytes) => {
-                // 3. Slice the data based on offset and size requested by the kernel
-                let start = offset as usize;
-                let end = std::cmp::min(start + size as usize, bytes.len());
-
-                if start >= bytes.len() {
-                    // EOF reached
-                    reply.data(&[]);
-                } else {
-                    // Return the requested chunk
-                    reply.data(&bytes[start..end]);
-                }
+                reply.data(&bytes);
             }
             Err(err) => {
                 error!("Failed to read file {} from server: {:?}", api_path, err);

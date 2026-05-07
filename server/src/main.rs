@@ -8,13 +8,14 @@
 // The server will listen on `0.0.0.0:3000`.
 
 use axum::{
-    body::Bytes,
+    body::Body,
     extract::{Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     env, io,
@@ -26,8 +27,9 @@ use std::{
 };
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
+use tokio_util::io::ReaderStream;
 
 const DEFAULT_STORAGE_ROOT: &str = "remote-storage";
 
@@ -63,6 +65,7 @@ enum StorageError {
     BadRequest(&'static str),
     NotFound(&'static str),
     Conflict(&'static str),
+    RequestBody(&'static str),
     Io(io::Error),
 }
 
@@ -82,6 +85,9 @@ impl IntoResponse for StorageError {
             StorageError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             StorageError::NotFound(message) => (StatusCode::NOT_FOUND, message).into_response(),
             StorageError::Conflict(message) => (StatusCode::CONFLICT, message).into_response(),
+            StorageError::RequestBody(message) => {
+                (StatusCode::BAD_REQUEST, message).into_response()
+            }
             StorageError::Io(error) => {
                 eprintln!("Storage error: {error}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Storage error").into_response()
@@ -161,6 +167,23 @@ fn directory_entry_from_metadata(
     })
 }
 
+// Parses an optional integer request header used for ranged file access.
+fn parse_optional_u64_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<u64>, StorageError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|text| text.parse::<u64>().ok())
+                .ok_or(StorageError::BadRequest("Invalid numeric header"))
+        })
+        .transpose()
+}
+
 // Lists the immediate children of one directory on disk.
 async fn list_entries(state: &AppState, path: &str) -> Result<Vec<DirectoryEntry>, StorageError> {
     let directory_path = state.resolve_path(path)?;
@@ -238,11 +261,12 @@ async fn make_directory(
     ))
 }
 
-// Handler for `GET /files/*path`: returns the stored bytes for a file.
+// Handler for `GET /files/*path`: streams a whole file, or just one requested byte range.
 async fn get_file(
     AxumPath(path): AxumPath<String>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, StorageError> {
+) -> Result<Response, StorageError> {
     let file_path = state.resolve_non_root_path(&path)?;
     let metadata = fs::metadata(&file_path)
         .await
@@ -252,30 +276,42 @@ async fn get_file(
         return Err(StorageError::BadRequest("Path is not a file"));
     }
 
-    let data = fs::read(&file_path)
+    let offset = parse_optional_u64_header(&headers, "X-File-Offset")?.unwrap_or(0);
+    let requested_size = parse_optional_u64_header(&headers, "X-File-Size")?;
+
+    if offset >= metadata.len() {
+        return Ok((StatusCode::OK, Body::empty()).into_response());
+    }
+
+    let mut file = fs::File::open(&file_path)
         .await
         .map_err(|error| StorageError::from_io(error, "File not found"))?;
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not seek file"))?;
 
-    Ok((StatusCode::OK, data))
+    let remaining_size = metadata.len() - offset;
+    let response_size = requested_size
+        .map(|size| size.min(remaining_size))
+        .unwrap_or(remaining_size);
+    let stream = ReaderStream::new(file.take(response_size));
+
+    Ok((StatusCode::OK, Body::from_stream(stream)).into_response())
 }
 
-// Handler for `PUT /files/*path`: writes a byte chunk at the requested offset.
+// Handler for `PUT /files/*path`: streams the request body to disk at the requested offset.
 async fn write_file(
     AxumPath(path): AxumPath<String>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    body: Body,
 ) -> Result<impl IntoResponse, StorageError> {
     let file_path = state.resolve_non_root_path(&path)?;
-    let offset: u64 = headers
-        .get("X-File-Offset")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let offset = parse_optional_u64_header(&headers, "X-File-Offset")?.unwrap_or(0);
+    let truncate_size = parse_optional_u64_header(&headers, "X-File-Truncate")?;
 
     println!(
-        "Server: Received {} byte for /{} (offset: {})",
-        body.len(),
+        "Server: Receiving streamed bytes for /{} (offset: {})",
         path.trim_matches('/'),
         offset
     );
@@ -286,6 +322,7 @@ async fn write_file(
             .map_err(|error| StorageError::from_io(error, "Could not create parent directory"))?;
     }
 
+    let mut body_stream = body.into_data_stream();
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -294,19 +331,34 @@ async fn write_file(
         .await
         .map_err(|error| StorageError::from_io(error, "Could not open file"))?;
 
-    if offset == 0 && body.is_empty() {
+    if let Some(size) = truncate_size {
+        file.set_len(size)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not resize file"))?;
+        return Ok(StatusCode::OK);
+    }
+
+    let mut wrote_anything = false;
+
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not seek file"))?;
+
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk.map_err(|_| StorageError::RequestBody("Could not read request body"))?;
+        wrote_anything = true;
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
+    }
+
+    if offset == 0 && !wrote_anything {
         file.set_len(0)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not truncate file"))?;
         return Ok(StatusCode::OK);
     }
 
-    file.seek(SeekFrom::Start(offset))
-        .await
-        .map_err(|error| StorageError::from_io(error, "Could not seek file"))?;
-    file.write_all(&body)
-        .await
-        .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
     file.flush()
         .await
         .map_err(|error| StorageError::from_io(error, "Could not flush file"))?;
@@ -487,6 +539,75 @@ mod tests {
         // 4. Check that both chunks were stitched together on disk.
         let saved_file = std::fs::read(root.path.join("test_upload.txt")).unwrap();
         assert_eq!(saved_file, b"Hello World!");
+    }
+
+    #[tokio::test]
+    async fn test_large_upload_exceeds_default_body_limit() {
+        // 1. Build a body larger than Axum's default buffered-body limit.
+        let root = TestRoot::new("large-upload");
+        let app = app_for_root(root.path());
+        let data = vec![b'x'; 3 * 1024 * 1024];
+
+        // 2. Upload it in one HTTP request; the server streams it to disk.
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/files/large.bin")
+            .body(Body::from(data.clone()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 3. Verify the whole body landed on disk.
+        assert_eq!(std::fs::read(root.path.join("large.bin")).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_range_read_returns_only_requested_bytes() {
+        // 1. Seed a file directly on disk.
+        let root = TestRoot::new("range-read");
+        std::fs::write(root.path.join("letters.txt"), b"abcdefghijklmnopqrstuvwxyz").unwrap();
+
+        // 2. Ask the API for only a small byte range.
+        let app = app_for_root(root.path());
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/files/letters.txt")
+            .header("X-File-Offset", "5")
+            .header("X-File-Size", "4")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 3. Verify only that slice was returned.
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"fghi");
+    }
+
+    #[tokio::test]
+    async fn test_resize_file_sets_file_length() {
+        // 1. Seed a small file directly on disk.
+        let root = TestRoot::new("resize");
+        let app = app_for_root(root.path());
+        std::fs::write(root.path.join("resize.bin"), b"hello").unwrap();
+
+        // 2. Ask the API to resize it without sending a data body.
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/files/resize.bin")
+            .header("X-File-Truncate", "1048576")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 3. Verify the file length changed on disk.
+        assert_eq!(
+            std::fs::metadata(root.path.join("resize.bin"))
+                .unwrap()
+                .len(),
+            1_048_576
+        );
     }
 
     #[tokio::test]
