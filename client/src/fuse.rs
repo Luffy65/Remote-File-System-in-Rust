@@ -174,14 +174,17 @@ impl RemoteFs {
         let mut inode_map_val = HashMap::new();
         let mut path_to_inode_val = HashMap::new();
 
+        let uid = unsafe { libc::getuid() as u32 };
+        let gid = unsafe { libc::getgid() as u32 };
+
         // Add root directory
         let root_attr = create_file_attr(
             FUSE_ROOT_ID,
             FileType::Directory,
             0,
             0o755,
-            0,
-            0,
+            uid,
+            gid,
             SystemTime::now(),
         );
         inode_map_val.insert(FUSE_ROOT_ID, CachedAttr::new(root_attr));

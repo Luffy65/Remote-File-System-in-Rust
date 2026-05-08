@@ -40,8 +40,8 @@ The server can be implemented using any language or framework, but should be RES
 
 ### Caching
 
-- Optional local caching layer for performance, implemented in the client with a TTL/LRU directory cache
-- Configurable cache invalidation strategy (TTL plus LRU eviction)
+- Optional local caching layer for performance
+- Configurable cache invalidation strategy (e.g., TTL or LRU)
 
 ## Non-Functional Requirements
 
@@ -64,8 +64,7 @@ The server can be implemented using any language or framework, but should be RES
 
 ### Server
 
-First, start the server. The current Rust server stores files on local disk under a configured storage root. Pass it as the
-first server argument, set `REMOTE_FS_ROOT`, or let it default to `./remote-storage`:
+First, start the server. The current Rust server stores files on local disk under a configured storage root. Pass it as the first server argument, set `REMOTE_FS_ROOT`, or let it default to `./remote-storage`:
 
 ```sh
 cargo run -p server -- ./remote-storage

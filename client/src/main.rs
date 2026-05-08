@@ -7,8 +7,6 @@ use fuser::MountOption;
 use log;
 use std::env;
 
-// The RemoteFs struct and its Filesystem impl are now in fuse.rs
-
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
