@@ -76,11 +76,12 @@ In another terminal, create a mount point and start the client:
 
 ```sh
 mkdir test_folder
-cargo run -p client -- test_folder http://127.0.0.1:3000
+cargo run -p client -- --daemon test_folder http://127.0.0.1:3000
 ```
 
-The mounted directory can then be used with normal file commands (from a third terminal) such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
-When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.
+The mounted directory can then be used with normal file commands such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
+When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.\
+For foreground debugging, omit `--daemon`.
 
 ## Notes
 

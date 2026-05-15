@@ -152,7 +152,6 @@ struct OpenHandle {
     ino: u64,
     path: String,
     kind: HandleKind,
-    flags: i32,
     dirty: bool,
 }
 
@@ -266,7 +265,7 @@ impl RemoteFs {
         ino
     }
 
-    fn allocate_handle(&self, ino: u64, path: String, kind: HandleKind, flags: i32) -> u64 {
+    fn allocate_handle(&self, ino: u64, path: String, kind: HandleKind, _flags: i32) -> u64 {
         let mut next_handle = self.next_handle.lock().unwrap();
         let handle = *next_handle;
         *next_handle += 1;
@@ -277,7 +276,6 @@ impl RemoteFs {
                 ino,
                 path,
                 kind,
-                flags,
                 dirty: false,
             },
         );
