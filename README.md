@@ -91,6 +91,16 @@ When launching the client, use `RUST_LOG=info` for normal runtime logs, or `RUST
 RUST_LOG=debug cargo run -p client -- test_folder http://127.0.0.1:3000
 ```
 
+### Smoke Test
+
+Run the local FUSE smoke test (it automatically starts client and server) with:
+
+```sh
+./scripts/smoke_fuse.sh
+```
+
+It will run some commands to test if they work. If some error pops up, it will be printed. Otherwise, we will just see "FUSE smoke test passed"
+
 ## Notes
 
 Logging (log::info!, log::debug!) is your friend during the development of a FUSE filesystem.
