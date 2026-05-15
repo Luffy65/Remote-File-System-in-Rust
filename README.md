@@ -83,6 +83,14 @@ The mounted directory can then be used with normal file commands such as `ls`, `
 When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.\
 For foreground debugging, omit `--daemon`.
 
+### Logs
+
+When launching the client, use `RUST_LOG=info` for normal runtime logs, or `RUST_LOG=debug` for detailed FUSE/API logs:
+
+```sh
+RUST_LOG=debug cargo run -p client -- test_folder http://127.0.0.1:3000
+```
+
 ## Notes
 
 Logging (log::info!, log::debug!) is your friend during the development of a FUSE filesystem.
@@ -129,4 +137,4 @@ Logging (log::info!, log::debug!) is your friend during the development of a FUS
 - [x] Proper file modification timestamps (modified_at) (currently we have `SystemTime::now()`)
 - [x] Graceful shutdown with signal handling
 - [x] File handle tracking for proper resource management
-- [ ] Better error handling and logging
+- [x] Better error handling and logging

@@ -1185,8 +1185,10 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "env_logger",
  "futures-util",
  "libc",
+ "log",
  "serde",
  "serde_json",
  "tokio",

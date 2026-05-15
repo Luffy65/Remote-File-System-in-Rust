@@ -76,6 +76,7 @@ impl AppState {
 enum StorageError {
     BadRequest(&'static str),
     NotFound(&'static str),
+    Forbidden(&'static str),
     Conflict(&'static str),
     RequestBody(&'static str),
     Io(io::Error),
@@ -86,6 +87,11 @@ impl StorageError {
         match error.kind() {
             io::ErrorKind::NotFound => StorageError::NotFound(not_found_message),
             io::ErrorKind::AlreadyExists => StorageError::Conflict("Path already exists"),
+            io::ErrorKind::PermissionDenied => StorageError::Forbidden("Permission denied"),
+            io::ErrorKind::InvalidInput
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::IsADirectory => StorageError::BadRequest("Invalid path"),
+            io::ErrorKind::DirectoryNotEmpty => StorageError::Conflict("Directory not empty"),
             _ => StorageError::Io(error),
         }
     }
@@ -96,12 +102,13 @@ impl IntoResponse for StorageError {
         match self {
             StorageError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             StorageError::NotFound(message) => (StatusCode::NOT_FOUND, message).into_response(),
+            StorageError::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
             StorageError::Conflict(message) => (StatusCode::CONFLICT, message).into_response(),
             StorageError::RequestBody(message) => {
                 (StatusCode::BAD_REQUEST, message).into_response()
             }
             StorageError::Io(error) => {
-                eprintln!("Storage error: {error}");
+                log::error!("Storage error: {error}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Storage error").into_response()
             }
         }
@@ -496,7 +503,7 @@ async fn make_directory(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, StorageError> {
     let directory_path = state.resolve_non_root_path(&path)?;
-    println!("Server: Creating directory at /{}", path.trim_matches('/'));
+    log::info!("Creating directory at /{}", path.trim_matches('/'));
 
     fs::create_dir(&directory_path)
         .await
@@ -557,8 +564,8 @@ async fn write_file(
     let offset = parse_optional_u64_header(&headers, "X-File-Offset")?.unwrap_or(0);
     let truncate_size = parse_optional_u64_header(&headers, "X-File-Truncate")?;
 
-    println!(
-        "Server: Receiving streamed bytes for /{} (offset: {})",
+    log::debug!(
+        "Receiving streamed bytes for /{} (offset: {})",
         path.trim_matches('/'),
         offset
     );
@@ -745,13 +752,15 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => println!("Shutdown requested with Ctrl-C."),
-        _ = terminate => println!("Shutdown requested with SIGTERM."),
+        _ = ctrl_c => log::info!("Shutdown requested with Ctrl-C."),
+        _ = terminate => log::info!("Shutdown requested with SIGTERM."),
     }
 }
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let storage_root = configured_storage_root();
     std::fs::create_dir_all(&storage_root).expect("Failed to create storage root");
     let storage_root =
@@ -759,8 +768,8 @@ async fn main() {
 
     let app = build_app(Arc::new(AppState::new(storage_root.clone())));
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    println!("Server storage root: {}", storage_root.display());
-    println!("Server listening on {}", addr);
+    log::info!("Server storage root: {}", storage_root.display());
+    log::info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app)

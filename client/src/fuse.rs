@@ -122,6 +122,16 @@ fn time_or_now(time: fuser::TimeOrNow) -> SystemTime {
     }
 }
 
+fn errno_from_api_error(error: &reqwest::Error) -> c_int {
+    match error.status().map(|status| status.as_u16()) {
+        Some(400) => libc::EINVAL,
+        Some(401 | 403) => libc::EACCES,
+        Some(404) => ENOENT,
+        Some(409) => libc::EEXIST,
+        _ => libc::EIO,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedAttr {
     attr: FileAttr,
@@ -630,7 +640,7 @@ impl Filesystem for RemoteFs {
                     "Failed to create directory {} on server: {:?}",
                     api_path, err
                 );
-                reply.error(libc::EIO); // I/O Error
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -834,8 +844,8 @@ impl Filesystem for RemoteFs {
                 }
             }
             Err(err) => {
-                error!("Network error during lookup of {}: {:?}", full_path, err);
-                reply.error(ENOENT);
+                error!("Failed to lookup {} on server: {:?}", full_path, err);
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -914,7 +924,7 @@ impl Filesystem for RemoteFs {
             }
             Err(err) => {
                 error!("Failed to create file {} on server: {:?}", api_path, err);
-                reply.error(libc::EIO);
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -977,7 +987,7 @@ impl Filesystem for RemoteFs {
             }
             Err(err) => {
                 error!("Failed to write to file {} on server: {:?}", api_path, err);
-                reply.error(libc::EIO);
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -1021,7 +1031,7 @@ impl Filesystem for RemoteFs {
                 Ok(metadata) => latest_metadata = Some(metadata),
                 Err(err) => {
                     error!("Failed to resize file {} on server: {:?}", api_path, err);
-                    reply.error(libc::EIO);
+                    reply.error(errno_from_api_error(&err));
                     return;
                 }
             }
@@ -1040,7 +1050,7 @@ impl Filesystem for RemoteFs {
                 Ok(metadata) => latest_metadata = Some(metadata),
                 Err(err) => {
                     error!("Failed to update metadata for {}: {:?}", api_path, err);
-                    reply.error(libc::EIO);
+                    reply.error(errno_from_api_error(&err));
                     return;
                 }
             }
@@ -1108,7 +1118,7 @@ impl Filesystem for RemoteFs {
             }
             Err(err) => {
                 error!("Failed to read file {} from server: {:?}", api_path, err);
-                reply.error(libc::EIO); // I/O Error
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -1146,7 +1156,7 @@ impl Filesystem for RemoteFs {
             }
             Err(err) => {
                 error!("Failed to delete file {} on server: {:?}", api_path, err);
-                reply.error(libc::EIO);
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -1187,7 +1197,7 @@ impl Filesystem for RemoteFs {
                     "Failed to delete directory {} on server: {:?}",
                     api_path, err
                 );
-                reply.error(libc::EIO);
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -1245,7 +1255,7 @@ impl Filesystem for RemoteFs {
                     "Failed to rename {} to {} on server: {:?}",
                     api_from, api_to, err
                 );
-                reply.error(libc::EIO);
+                reply.error(errno_from_api_error(&err));
             }
         }
     }
@@ -1335,7 +1345,7 @@ impl Filesystem for RemoteFs {
                         "Failed to list directory {} from server: {:?}",
                         current_path, err
                     );
-                    reply.error(ENOENT);
+                    reply.error(errno_from_api_error(&err));
                     return;
                 }
             }
