@@ -15,8 +15,10 @@ use std::time::SystemTime;
 // FUSE callbacks translate kernel operations into HTTP API calls and keep
 // RemoteFs' local inode/path caches coherent after each successful mutation.
 impl Filesystem for RemoteFs {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut fuser::KernelConfig) -> Result<(), c_int> {
+    fn init(&mut self, _req: &Request<'_>, config: &mut fuser::KernelConfig) -> Result<(), c_int> {
         info!("Filesystem init method called.");
+        let _ = config.set_max_write(1048576);
+        let _ = config.set_max_read(1048576);
         Ok(())
     }
 
