@@ -3,8 +3,6 @@ use reqwest;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -28,9 +26,6 @@ pub struct RemoteMetadata {
     pub gid: Option<u32>,
 }
 
-fn http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()
-}
 
 fn unix_seconds_from_system_time(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
@@ -65,6 +60,7 @@ fn add_optional_metadata_headers(
 }
 
 pub async fn list_directory(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
 ) -> Result<Vec<DirectoryEntry>, reqwest::Error> {
@@ -79,7 +75,7 @@ pub async fn list_directory(
 
     log::debug!("Requesting directory list from URL: {}", request_url);
 
-    let response = http_client()?.get(&request_url).send().await?;
+    let response = client.get(&request_url).send().await?;
     log::debug!("Received response: {:?}", response.status());
 
     let entries = response
@@ -91,6 +87,7 @@ pub async fn list_directory(
 
 // Requests only one byte range from the server instead of downloading the whole file.
 pub async fn read_file(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     offset: u64,
@@ -107,7 +104,6 @@ pub async fn read_file(
         size
     );
 
-    let client = http_client()?;
     let response = client
         .get(&request_url)
         .header("X-File-Offset", offset.to_string())
@@ -115,12 +111,12 @@ pub async fn read_file(
         .send()
         .await?
         .error_for_status()?;
-    let bytes = response.bytes().await?;
 
-    Ok(bytes.to_vec())
+    Ok(response.bytes().await?.to_vec())
 }
 
 pub async fn create_directory(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     mode: u32,
@@ -131,7 +127,6 @@ pub async fn create_directory(
     let request_url = format!("{}/mkdir/{}", normalized_base, normalized_path);
     log::debug!("Requesting directory creation: POST {}", request_url);
 
-    let client = http_client()?;
     let response =
         add_optional_metadata_headers(client.post(&request_url), Some(mode), None, None, None)
             .send()
@@ -145,6 +140,7 @@ pub async fn create_directory(
 
 // Sends an empty file to the server
 pub async fn create_file(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     mode: u32,
@@ -155,7 +151,6 @@ pub async fn create_file(
 
     log::debug!("API: Creating new empty file via PUT {}", request_url);
 
-    let client = http_client()?;
     let request = client
         .put(&request_url)
         .header("X-File-Offset", "0")
@@ -172,6 +167,7 @@ pub async fn create_file(
 
 // Sends a chunk of bytes to the server at a specific offset
 pub async fn write_file(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     data: &[u8],
@@ -188,7 +184,6 @@ pub async fn write_file(
         request_url
     );
 
-    let client = http_client()?;
     let response = client
         .put(&request_url)
         .header("X-File-Offset", offset.to_string())
@@ -204,6 +199,7 @@ pub async fn write_file(
 
 // Asks the server to resize a file without sending file contents.
 pub async fn resize_file(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     size: u64,
@@ -214,7 +210,6 @@ pub async fn resize_file(
 
     log::debug!("API: Resizing {} to {} bytes", request_url, size);
 
-    let client = http_client()?;
     let response = client
         .put(&request_url)
         .header("X-File-Truncate", size.to_string())
@@ -229,6 +224,7 @@ pub async fn resize_file(
 }
 
 pub async fn update_metadata(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     mode: Option<u32>,
@@ -242,7 +238,6 @@ pub async fn update_metadata(
 
     log::debug!("API: Updating metadata for {}", request_url);
 
-    let client = http_client()?;
     let response =
         add_optional_metadata_headers(client.patch(&request_url), mode, uid, gid, modified_at)
             .send()
@@ -254,14 +249,17 @@ pub async fn update_metadata(
         .await?)
 }
 
-pub async fn delete_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+pub async fn delete_file(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str
+) -> Result<(), reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
     let request_url = format!("{}/files/{}", normalized_base, normalized_path);
 
     log::debug!("API: Deleting {}", request_url);
 
-    let client = http_client()?;
     let response = client.delete(&request_url).send().await?;
 
     response.error_for_status()?;
@@ -274,7 +272,12 @@ struct RenameRequest<'a> {
     to: &'a str,
 }
 
-pub async fn rename_file(base_url: &str, from: &str, to: &str) -> Result<(), reqwest::Error> {
+pub async fn rename_file(
+    client: &reqwest::Client,
+    base_url: &str,
+    from: &str,
+    to: &str
+) -> Result<(), reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let request_url = format!("{}/rename", normalized_base);
     let normalized_from = from.trim_start_matches('/');
@@ -287,7 +290,6 @@ pub async fn rename_file(base_url: &str, from: &str, to: &str) -> Result<(), req
         request_url
     );
 
-    let client = http_client()?;
     let response = client
         .post(&request_url)
         .json(&RenameRequest {

@@ -171,6 +171,7 @@ struct OpenHandle {
 #[derive(Debug)]
 pub struct RemoteFs {
     server_addr: String,
+    http_client: reqwest::Client,
     runtime: Arc<tokio::runtime::Runtime>,
     inode_map: Arc<Mutex<HashMap<u64, CachedAttr>>>,
     path_to_inode: Arc<Mutex<HashMap<String, u64>>>,
@@ -183,11 +184,19 @@ pub struct RemoteFs {
 impl RemoteFs {
     pub fn new(server_addr: &str) -> Self {
         let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let client = reqwest::Client::new();
         let mut inode_map_val = HashMap::new();
         let mut path_to_inode_val = HashMap::new();
 
+        #[cfg(unix)]
         let uid = unsafe { libc::getuid() as u32 };
+        #[cfg(not(unix))]
+        let uid = 0;
+
+        #[cfg(unix)]
         let gid = unsafe { libc::getgid() as u32 };
+        #[cfg(not(unix))]
+        let gid = 0;
 
         // Add root directory
         let root_attr = create_file_attr(
@@ -209,6 +218,7 @@ impl RemoteFs {
 
         RemoteFs {
             server_addr: server_addr.to_string(),
+            http_client: client,
             runtime: rt,
             inode_map: Arc::new(Mutex::new(inode_map_val)),
             path_to_inode: Arc::new(Mutex::new(path_to_inode_val)),
@@ -375,7 +385,7 @@ impl RemoteFs {
         let api_path = Self::api_path(&cache_key);
         let entries = self
             .runtime
-            .block_on(api::list_directory(&self.server_addr, &api_path))?;
+            .block_on(api::list_directory(&self.http_client, &self.server_addr, &api_path))?;
 
         self.directory_cache
             .lock()

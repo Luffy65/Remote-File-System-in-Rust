@@ -15,6 +15,8 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -484,6 +486,7 @@ fn build_app(shared_state: Arc<AppState>) -> Router {
         .route("/metadata/*path", patch(update_metadata))
         .route("/mkdir/*path", post(make_directory))
         .route("/rename", post(rename_entry))
+        .layer(TraceLayer::new_for_http())
         .with_state(shared_state)
 }
 
@@ -759,7 +762,15 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    //env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                // This string tells it to show debug logs for your server AND the HTTP middleware
+                .unwrap_or_else(|_| "server=debug,tower_http=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     let storage_root = configured_storage_root();
     std::fs::create_dir_all(&storage_root).expect("Failed to create storage root");

@@ -54,6 +54,7 @@ impl Filesystem for RemoteFs {
 
         // Tell the remote server to create it and return real metadata.
         match self.runtime.block_on(api::create_directory(
+            &self.http_client,
             &self.server_addr,
             api_path,
             effective_mode,
@@ -340,6 +341,7 @@ impl Filesystem for RemoteFs {
 
         // Tell the remote server to initialize the empty file and return real metadata.
         match self.runtime.block_on(api::create_file(
+            &self.http_client,
             &self.server_addr,
             api_path,
             effective_mode,
@@ -406,6 +408,7 @@ impl Filesystem for RemoteFs {
 
         // Send the chunk of bytes to the server.
         match self.runtime.block_on(api::write_file(
+            &self.http_client,
             &self.server_addr,
             api_path,
             data,
@@ -460,9 +463,7 @@ impl Filesystem for RemoteFs {
 
         // If the OS resizes a file, mirror that size change on the server.
         if let Some(s) = size {
-            match self
-                .runtime
-                .block_on(api::resize_file(&self.server_addr, api_path, s))
+            match self.runtime.block_on(api::resize_file(&self.http_client, &self.server_addr, api_path, s))
             {
                 Ok(metadata) => latest_metadata = Some(metadata),
                 Err(err) => {
@@ -476,6 +477,7 @@ impl Filesystem for RemoteFs {
         let requested_mtime = _mtime.map(time_or_now);
         if mode.is_some() || uid.is_some() || gid.is_some() || requested_mtime.is_some() {
             match self.runtime.block_on(api::update_metadata(
+                &self.http_client,
                 &self.server_addr,
                 api_path,
                 mode.map(|mode| mode & 0o7777),
@@ -544,6 +546,7 @@ impl Filesystem for RemoteFs {
 
         // Fetch only the byte range requested by the kernel.
         match self.runtime.block_on(api::read_file(
+            &self.http_client,
             &self.server_addr,
             api_path,
             offset as u64,
@@ -582,9 +585,7 @@ impl Filesystem for RemoteFs {
         }
 
         let api_path = full_path.trim_start_matches('/');
-        match self
-            .runtime
-            .block_on(api::delete_file(&self.server_addr, api_path))
+        match self.runtime.block_on(api::delete_file(&self.http_client, &self.server_addr, api_path))
         {
             Ok(_) => {
                 self.remove_cached_path(&full_path);
@@ -620,9 +621,7 @@ impl Filesystem for RemoteFs {
         }
 
         let api_path = full_path.trim_start_matches('/');
-        match self
-            .runtime
-            .block_on(api::delete_file(&self.server_addr, api_path))
+        match self.runtime.block_on(api::delete_file(&self.http_client, &self.server_addr, api_path))
         {
             Ok(_) => {
                 self.remove_cached_path(&full_path);
@@ -678,9 +677,7 @@ impl Filesystem for RemoteFs {
         let api_from = from_path.trim_start_matches('/');
         let api_to = to_path.trim_start_matches('/');
 
-        match self
-            .runtime
-            .block_on(api::rename_file(&self.server_addr, api_from, api_to))
+        match self.runtime.block_on(api::rename_file(&self.http_client, &self.server_addr, api_from, api_to))
         {
             Ok(_) => {
                 self.rename_cached_path(&from_path, &to_path);

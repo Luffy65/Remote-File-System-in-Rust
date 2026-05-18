@@ -112,6 +112,8 @@ fn main() {
     let options = vec![
         MountOption::FSName("remoteFS".to_string()),
         MountOption::AutoUnmount,
+        MountOption::CUSTOM("max_write=1048576".to_string()),
+        MountOption::CUSTOM("max_read=1048576".to_string()),
         //MountOption::AllowRoot, // Optional: consider security implications
     ];
 
