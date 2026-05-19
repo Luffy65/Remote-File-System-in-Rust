@@ -19,11 +19,11 @@ This project aims to implement a remote file system client in Rust that presents
 
 - [x] Mount a virtual file system to a local path (e.g., /mnt/remote-fs )
 - [x] Display directories and files from a remote source
-- [ ] Read files from the remote server
-- [ ] Write modified files back to the remote server
-- [ ] Support creation, deletion, and renaming of files and directories
-- [ ] Maintain file attributes such as size, timestamps, and permissions (as feasible)
-- [ ] Run as a background daemon process that handles filesystem operations continuously
+- [x] Read files from the remote server
+- [x] Write modified files back to the remote server
+- [x] Support creation, deletion, and renaming of files and directories
+- [x] Maintain file attributes such as size, timestamps, and permissions (as feasible)
+- [x] Run as a background daemon process that handles filesystem operations continuously
 
 ### Server Interface and implementation
 
@@ -34,6 +34,7 @@ The server should offer a set RESTful API for file operations:
 - PUT /files/`path` – Write file contents
 - POST /mkdir/`path` – Create directory
 - DELETE /files/`path` – Delete file or directory
+- POST /rename – Rename or move a file/directory
 
 The server can be implemented using any language or framework, but should be RESTful and stateless.
 
@@ -59,28 +60,91 @@ The server can be implemented using any language or framework, but should be RES
 
 - Graceful startup and shutdown procedures
 
+## Usage
+
+### Server
+
+First, start the server. The current Rust server stores files on local disk under a configured storage root. Pass it as the first server argument, set `REMOTE_FS_ROOT`, or let it default to `./remote-storage`:
+
+```sh
+cargo run -p server -- ./remote-storage
+```
+
+### Client
+
+In another terminal, create a mount point and start the client:
+
+```sh
+mkdir test_folder
+cargo run -p client -- --daemon test_folder http://127.0.0.1:3000
+```
+
+The mounted directory can then be used with normal file commands such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
+When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.\
+For foreground debugging, omit `--daemon`.
+
+### Logs
+
+When launching the client, use `RUST_LOG=info` for normal runtime logs, or `RUST_LOG=debug` for detailed FUSE/API logs:
+
+```sh
+RUST_LOG=debug cargo run -p client -- test_folder http://127.0.0.1:3000
+```
+
+### Smoke Test
+
+Run the local FUSE smoke test (it automatically starts client and server) with:
+
+```sh
+./scripts/smoke_fuse.sh
+```
+
+It will run some commands to test if they work. If some error pops up, it will be printed. Otherwise, we will just see "FUSE smoke test passed"
+
 ## Notes
 
-Il logging (log::info!, log::debug!) è tuo amico durante lo sviluppo di un filesystem FUSE.
+Logging (log::info!, log::debug!) is your friend during the development of a FUSE filesystem.
 
 ## TODO
 
-### Phase 1: Core Setup & Basic Server Interaction
+### Server Endpoints
 
-#### 🎯 Sub-Goal 4: Basic File Read (Read-Only)
+- [x] `GET /list/*path` – List directory contents
+- [x] `GET /files/*path` – Read file contents
+- [x] `PUT /files/*path` – Write file contents (replace/create)
+- [x] `POST /mkdir/*path` – Create directory
+- [x] `DELETE /files/*path` – Delete file or directory
+- [x] `POST /rename` – Rename or move file/directory
 
-* **Task:** Define the `GET /files/path` server endpoint for reading file content.
-    * The mock server should be updated to serve predefined content for a specific file path (e.g., `GET /files/hello.txt` returns "Hello, World!").
-* **Task:** In the Rust FUSE client, implement the `lookup` FUSE operation.
-    * When a file is looked up, the client should (for now) just confirm its existence based on a simulated call or by checking if it was listed by `readdir`.
-* **Task:** Implement the `getattr` FUSE operation.
-    * This should return basic attributes (like file type, size, permissions) for files and directories. For now, the size can be hardcoded for the mock file or derived from the mock server's `/list` response.
-* **Task:** Implement the `open` and `read` FUSE operations.
-    * `open`: Can be a simple pass-through for now, ensuring the file type is regular.
-    * `read`:
-        1.  Receive a path and offset from the FUSE kernel.
-        2.  Make an HTTP GET request to the mock server's `GET /files/path_from_fuse`.
-        3.  Return the (mock) file content to the FUSE kernel via `reply.data()`.
-* **Goal:** Be able to `cat /mnt/remote-fs/hello.txt` (or equivalent) and see the content served by your mock server.
+### Client API Functions
 
----
+- [x] `list_directory()` – Send directory listing requests
+- [x] `read_file()` – Send byte-range file read requests
+- [x] `create_file()` – Send empty file creation requests
+- [x] `create_directory()` – Send directory creation requests
+- [x] `write_file()` – Send file write requests
+- [x] `resize_file()` – Send file resize requests
+- [x] `delete_file()` – Send file delete requests
+- [x] `rename_file()` – Send file rename requests
+
+### FUSE Operations
+
+- [x] `lookup()` – Resolve paths to inodes
+- [x] `getattr()` – Return file and directory attributes
+- [x] `readdir()` – List directory entries
+- [x] `read()` – Read file data
+- [x] `create()` – Create files
+- [x] `mkdir()` – Create directories
+- [x] `write()` – Write file data
+- [x] `unlink()` – Delete files
+- [x] `rmdir()` – Delete directories
+- [x] `rename()` – Rename/move files
+
+### Improvements
+
+- [x] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
+- [x] Better file permission handling (currently hardcoded)
+- [x] Proper file modification timestamps (modified_at) (currently we have `SystemTime::now()`)
+- [x] Graceful shutdown with signal handling
+- [x] File handle tracking for proper resource management
+- [x] Better error handling and logging
