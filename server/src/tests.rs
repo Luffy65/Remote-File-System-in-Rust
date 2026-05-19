@@ -1,6 +1,6 @@
 use super::*;
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     http::{Method, Request, StatusCode},
 };
 use serde_json::json;
@@ -93,6 +93,36 @@ async fn test_large_upload_exceeds_default_body_limit() {
 
     // 3. Verify the whole body landed on disk.
     assert_eq!(std::fs::read(root.path.join("large.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn test_upload_over_100_mb_streams_to_disk() {
+    // Stream a body larger than 100 MiB without keeping a second full copy for verification.
+    let root = TestRoot::new("over-100-mb-upload");
+    let app = app_for_root(root.path());
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    const CHUNK_COUNT: usize = 101;
+    const EXPECTED_SIZE: u64 = (CHUNK_SIZE * CHUNK_COUNT) as u64;
+
+    let chunk = Bytes::from(vec![b'x'; CHUNK_SIZE]);
+    let body = Body::from_stream(futures_util::stream::iter(
+        (0..CHUNK_COUNT).map(move |_| Ok::<Bytes, std::io::Error>(chunk.clone())),
+    ));
+
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/over-100-mb.bin")
+        .body(body)
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        std::fs::metadata(root.path.join("over-100-mb.bin"))
+            .unwrap()
+            .len(),
+        EXPECTED_SIZE
+    );
 }
 
 #[tokio::test]

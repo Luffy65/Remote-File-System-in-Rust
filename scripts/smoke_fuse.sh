@@ -11,6 +11,9 @@ STORAGE_DIR="$TMP_DIR/storage"
 MOUNT_DIR="$TMP_DIR/mnt"
 SERVER_LOG="$TMP_DIR/server.log"
 CLIENT_LOG="$TMP_DIR/client.log"
+LARGE_SOURCE="$TMP_DIR/large-source.bin"
+LARGE_REMOTE="$MOUNT_DIR/large-upload.bin"
+LARGE_STORED="$STORAGE_DIR/large-upload.bin"
 SERVER_PID=""
 CLIENT_PID=""
 
@@ -94,5 +97,9 @@ test "$(cat "$MOUNT_DIR/docs/renamed.txt")" = "hello remote fs"
 rm "$MOUNT_DIR/docs/renamed.txt"
 rmdir "$MOUNT_DIR/docs"
 test ! -e "$STORAGE_DIR/docs"
+
+dd if=/dev/zero of="$LARGE_SOURCE" bs=1048576 count=200 >/dev/null 2>&1
+cp "$LARGE_SOURCE" "$LARGE_REMOTE"
+cmp -s "$LARGE_SOURCE" "$LARGE_STORED"
 
 echo "FUSE smoke test passed"
