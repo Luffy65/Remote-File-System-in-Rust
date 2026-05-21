@@ -109,9 +109,11 @@ fn main() {
 
     log::info!("Mounting to {}, server URL: {}", mountpoint, server_url);
 
-    let mut options = vec![MountOption::FSName("remoteFS".to_string())];
-    #[cfg(not(target_os = "linux"))]
-    options.push(MountOption::AutoUnmount);
+    let options = vec![
+        MountOption::FSName("remoteFS".to_string()),
+        #[cfg(not(target_os = "linux"))]
+        MountOption::AutoUnmount,
+    ];
 
     let fs = fuse::RemoteFs::new(&server_url);
 
