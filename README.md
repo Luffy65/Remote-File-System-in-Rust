@@ -79,6 +79,8 @@ mkdir test_folder
 cargo run -p client -- --daemon test_folder http://127.0.0.1:3000
 ```
 
+If the client runs on another PC or VM, replace `127.0.0.1` with the server machine address.
+
 The mounted directory can then be used with normal file commands such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
 When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.\
 For foreground debugging, omit `--daemon`.
@@ -100,51 +102,3 @@ Run the local FUSE smoke test (it automatically starts client and server) with:
 ```
 
 It will run some commands to test if they work. If some error pops up, it will be printed. Otherwise, we will just see "FUSE smoke test passed"
-
-## Notes
-
-Logging (log::info!, log::debug!) is your friend during the development of a FUSE filesystem.
-
-## TODO
-
-### Server Endpoints
-
-- [x] `GET /list/*path` – List directory contents
-- [x] `GET /files/*path` – Read file contents
-- [x] `PUT /files/*path` – Write file contents (replace/create)
-- [x] `POST /mkdir/*path` – Create directory
-- [x] `DELETE /files/*path` – Delete file or directory
-- [x] `POST /rename` – Rename or move file/directory
-
-### Client API Functions
-
-- [x] `list_directory()` – Send directory listing requests
-- [x] `read_file()` – Send byte-range file read requests
-- [x] `create_file()` – Send empty file creation requests
-- [x] `create_directory()` – Send directory creation requests
-- [x] `write_file()` – Send file write requests
-- [x] `resize_file()` – Send file resize requests
-- [x] `delete_file()` – Send file delete requests
-- [x] `rename_file()` – Send file rename requests
-
-### FUSE Operations
-
-- [x] `lookup()` – Resolve paths to inodes
-- [x] `getattr()` – Return file and directory attributes
-- [x] `readdir()` – List directory entries
-- [x] `read()` – Read file data
-- [x] `create()` – Create files
-- [x] `mkdir()` – Create directories
-- [x] `write()` – Write file data
-- [x] `unlink()` – Delete files
-- [x] `rmdir()` – Delete directories
-- [x] `rename()` – Rename/move files
-
-### Improvements
-
-- [x] Pass from a mock server to a real one: replace the in-memory HashMap/HashSet with a real backend (local disk storage under a configured root directory) (important)
-- [x] Better file permission handling (currently hardcoded)
-- [x] Proper file modification timestamps (modified_at) (currently we have `SystemTime::now()`)
-- [x] Graceful shutdown with signal handling
-- [x] File handle tracking for proper resource management
-- [x] Better error handling and logging
