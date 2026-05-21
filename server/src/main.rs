@@ -469,6 +469,11 @@ async fn list_entries(state: &AppState, path: &str) -> Result<Vec<DirectoryEntry
     }
 
     entries.sort_by(|left, right| left.name.cmp(&right.name));
+    log::info!(
+        "Listed /{} ({} entries)",
+        path.trim_matches('/'),
+        entries.len()
+    );
     Ok(entries)
 }
 
@@ -503,7 +508,6 @@ async fn make_directory(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, StorageError> {
     let directory_path = state.resolve_non_root_path(&path)?;
-    log::info!("Creating directory at /{}", path.trim_matches('/'));
 
     fs::create_dir(&directory_path)
         .await
@@ -511,6 +515,7 @@ async fn make_directory(
 
     apply_metadata_headers(&directory_path, &headers).await?;
     let metadata = entry_metadata_for_path(&directory_path).await?;
+    log::info!("Created directory /{}", path.trim_matches('/'));
 
     Ok((StatusCode::CREATED, Json(metadata)))
 }
@@ -534,6 +539,11 @@ async fn get_file(
     let requested_size = parse_optional_u64_header(&headers, "X-File-Size")?;
 
     if offset >= metadata.len() {
+        log::info!(
+            "Read /{} (offset: {}, bytes: 0)",
+            path.trim_matches('/'),
+            offset
+        );
         return Ok((StatusCode::OK, Body::empty()).into_response());
     }
 
@@ -548,6 +558,12 @@ async fn get_file(
     let response_size = requested_size
         .map(|size| size.min(remaining_size))
         .unwrap_or(remaining_size);
+    log::info!(
+        "Read /{} (offset: {}, bytes: {})",
+        path.trim_matches('/'),
+        offset,
+        response_size
+    );
     let stream = ReaderStream::new(file.take(response_size));
 
     Ok((StatusCode::OK, Body::from_stream(stream)).into_response())
@@ -595,10 +611,11 @@ async fn write_file(
         drop(file);
         apply_metadata_headers(&file_path, &headers).await?;
         let metadata = entry_metadata_for_path(&file_path).await?;
+        log::info!("Resized /{} to {} bytes", path.trim_matches('/'), size);
         return Ok((StatusCode::OK, Json(metadata)).into_response());
     }
 
-    let mut wrote_anything = false;
+    let mut bytes_written = 0;
 
     file.seek(SeekFrom::Start(offset))
         .await
@@ -606,13 +623,13 @@ async fn write_file(
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = chunk.map_err(|_| StorageError::RequestBody("Could not read request body"))?;
-        wrote_anything = true;
+        bytes_written += chunk.len();
         file.write_all(&chunk)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
     }
 
-    if offset == 0 && !wrote_anything {
+    if offset == 0 && bytes_written == 0 {
         file.set_len(0)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not truncate file"))?;
@@ -622,6 +639,7 @@ async fn write_file(
         drop(file);
         apply_metadata_headers(&file_path, &headers).await?;
         let metadata = entry_metadata_for_path(&file_path).await?;
+        log::info!("Created or truncated /{}", path.trim_matches('/'));
         return Ok((StatusCode::OK, Json(metadata)).into_response());
     }
 
@@ -632,6 +650,12 @@ async fn write_file(
 
     apply_metadata_headers(&file_path, &headers).await?;
     let metadata = entry_metadata_for_path(&file_path).await?;
+    log::info!(
+        "Wrote /{} (offset: {}, bytes: {})",
+        path.trim_matches('/'),
+        offset,
+        bytes_written
+    );
 
     Ok((StatusCode::OK, Json(metadata)).into_response())
 }
@@ -649,6 +673,7 @@ async fn update_metadata(
 
     apply_metadata_headers(&target_path, &headers).await?;
     let metadata = entry_metadata_for_path(&target_path).await?;
+    log::info!("Updated metadata for /{}", path.trim_matches('/'));
 
     Ok((StatusCode::OK, Json(metadata)))
 }
@@ -667,10 +692,12 @@ async fn delete_path(
         fs::remove_dir_all(&target_path)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not remove directory"))?;
+        log::info!("Deleted directory /{}", path.trim_matches('/'));
     } else {
         fs::remove_file(&target_path)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not remove file"))?;
+        log::info!("Deleted file /{}", path.trim_matches('/'));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -714,6 +741,11 @@ async fn rename_entry(
     fs::rename(&from_path, &to_path)
         .await
         .map_err(|error| StorageError::from_io(error, "Could not rename path"))?;
+    log::info!(
+        "Renamed /{} to /{}",
+        payload.from.trim_matches('/'),
+        payload.to.trim_matches('/')
+    );
 
     Ok(StatusCode::OK)
 }
