@@ -14,6 +14,9 @@ CLIENT_LOG="$TMP_DIR/client.log"
 LARGE_SOURCE="$TMP_DIR/large-source.bin"
 LARGE_REMOTE="$MOUNT_DIR/large-upload.bin"
 LARGE_STORED="$STORAGE_DIR/large-upload.bin"
+GROWN_SOURCE="$TMP_DIR/grown-source.txt"
+GROWN_REMOTE="$MOUNT_DIR/grown.txt"
+GROWN_STORED="$STORAGE_DIR/grown.txt"
 SERVER_PID=""
 CLIENT_PID=""
 
@@ -97,6 +100,11 @@ test "$(cat "$MOUNT_DIR/docs/renamed.txt")" = "hello remote fs"
 rm "$MOUNT_DIR/docs/renamed.txt"
 rmdir "$MOUNT_DIR/docs"
 test ! -e "$STORAGE_DIR/docs"
+
+awk 'BEGIN { for (i = 0; i < 5617372; i++) print "file growth check line" }' >"$GROWN_SOURCE"
+head -n 1 "$GROWN_SOURCE" >"$GROWN_REMOTE"
+tail -n +2 "$GROWN_SOURCE" >>"$GROWN_REMOTE"
+cmp -s "$GROWN_SOURCE" "$GROWN_STORED"
 
 dd if=/dev/zero of="$LARGE_SOURCE" bs=1048576 count=200 >/dev/null 2>&1
 cp "$LARGE_SOURCE" "$LARGE_REMOTE"
