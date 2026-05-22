@@ -32,7 +32,7 @@ fn create_file_attr(
     FileAttr {
         ino,
         size,
-        blocks: (size + 511) / 512, // Calculate blocks assuming 512 byte block size
+        blocks: size.div_ceil(512), // Calculate blocks assuming 512 byte block size
         atime: modified_at,
         mtime: modified_at,
         ctime: modified_at,
@@ -130,6 +130,13 @@ fn errno_from_api_error(error: &reqwest::Error) -> c_int {
         Some(404) => ENOENT,
         Some(409) => libc::EEXIST,
         _ => libc::EIO,
+    }
+}
+
+fn errno_from_rmdir_error(error: &reqwest::Error) -> c_int {
+    match error.status().map(|status| status.as_u16()) {
+        Some(409) => libc::ENOTEMPTY,
+        _ => errno_from_api_error(error),
     }
 }
 

@@ -33,7 +33,8 @@ The server should offer a set RESTful API for file operations:
 - GET /files/`path` – Read file contents
 - PUT /files/`path` – Write file contents
 - POST /mkdir/`path` – Create directory
-- DELETE /files/`path` – Delete file or directory
+- DELETE /files/`path` – Delete file
+- DELETE /directories/`path` – Delete empty directory
 - POST /rename – Rename or move a file/directory
 
 The server can be implemented using any language or framework, but should be RESTful and stateless.

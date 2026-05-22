@@ -280,25 +280,55 @@ async fn test_directory_listing_reflects_writes_and_mkdir() {
 }
 
 #[tokio::test]
-async fn test_delete_removes_file_and_directory_tree() {
-    // 1. Seed a small directory tree directly on disk.
+async fn test_delete_removes_file_and_empty_directory() {
     let root = TestRoot::new("delete");
-    std::fs::create_dir_all(root.path.join("docs/archive")).unwrap();
-    std::fs::write(root.path.join("docs/archive/old.txt"), b"old").unwrap();
+    std::fs::write(root.path.join("old.txt"), b"old").unwrap();
+    std::fs::create_dir(root.path.join("empty")).unwrap();
 
-    // 2. Delete the tree through the API.
+    let app = app_for_root(root.path());
+    let delete_file = Request::builder()
+        .method(Method::DELETE)
+        .uri("/files/old.txt")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(delete_file).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let delete_dir = Request::builder()
+        .method(Method::DELETE)
+        .uri("/directories/empty")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(delete_dir).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    assert!(!root.path.join("old.txt").exists());
+    assert!(!root.path.join("empty").exists());
+}
+
+#[tokio::test]
+async fn test_delete_directory_rejects_non_empty_directory() {
+    let root = TestRoot::new("delete-non-empty");
+    std::fs::create_dir(root.path.join("docs")).unwrap();
+    std::fs::write(root.path.join("docs/old.txt"), b"old").unwrap();
+
     let app = app_for_root(root.path());
     let request = Request::builder()
         .method(Method::DELETE)
-        .uri("/files/docs")
+        .uri("/directories/docs")
         .body(Body::empty())
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 
-    // 3. Verify both the directory and its nested file are gone.
-    assert!(!root.path.join("docs").exists());
-    assert!(!root.path.join("docs/archive/old.txt").exists());
+    assert_eq!(
+        std::fs::read(root.path.join("docs/old.txt")).unwrap(),
+        b"old"
+    );
 }
 
 #[tokio::test]
@@ -351,6 +381,32 @@ async fn test_rename_rejects_moving_directory_inside_itself() {
 
     // 3. Verify the original tree is still in place.
     assert!(root.path.join("docs/archive").is_dir());
+}
+
+#[tokio::test]
+async fn test_rename_does_not_delete_existing_non_empty_directory() {
+    let root = TestRoot::new("rename-existing-dir");
+    std::fs::create_dir(root.path.join("source")).unwrap();
+    std::fs::create_dir_all(root.path.join("target/archive")).unwrap();
+    std::fs::write(root.path.join("target/archive/old.txt"), b"old").unwrap();
+
+    let app = app_for_root(root.path());
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/rename")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "from": "source", "to": "target" }).to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert!(response.status().is_client_error());
+
+    assert!(root.path.join("source").is_dir());
+    assert_eq!(
+        std::fs::read(root.path.join("target/archive/old.txt")).unwrap(),
+        b"old"
+    );
 }
 
 #[tokio::test]

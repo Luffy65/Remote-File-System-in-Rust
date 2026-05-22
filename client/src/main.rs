@@ -3,7 +3,6 @@ mod cache;
 mod fuse;
 
 use fuser::MountOption;
-use log;
 use std::{
     env, io,
     process::{Command, Stdio},
@@ -71,7 +70,7 @@ async fn wait_for_shutdown_signal() {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let program_name = args.get(0).map_or("remote-fs-client", |s| s.as_str());
+    let program_name = args.first().map_or("remote-fs-client", |s| s.as_str());
     let spawn_daemon_mode = args.get(1).is_some_and(|arg| arg == "--daemon");
     let serve_daemon_mode = args.get(1).is_some_and(|arg| arg == "--serve-daemon");
     let mountpoint_index = if spawn_daemon_mode || serve_daemon_mode {
@@ -115,6 +114,7 @@ fn main() {
         MountOption::AutoUnmount,
     ];
 
+    // Create the FUSE filesystem instance
     let fs = fuse::RemoteFs::new(&server_url);
 
     if serve_daemon_mode {
@@ -135,10 +135,11 @@ fn main() {
 
     log::info!("Filesystem mounted successfully on {}.", mountpoint);
 
-    let shutdown_runtime =
+    // Wait for shutdown signal in a separate runtime to avoid blocking the FUSE session
+    let shutdown_signal_runtime =
         tokio::runtime::Runtime::new().expect("Failed to create shutdown runtime");
-    shutdown_runtime.block_on(wait_for_shutdown_signal());
+    shutdown_signal_runtime.block_on(wait_for_shutdown_signal());
 
     log::info!("Unmounting filesystem from {}", mountpoint);
-    let _ = session.join();
+    session.join();
 }

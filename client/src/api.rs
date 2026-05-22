@@ -1,5 +1,3 @@
-use log;
-use reqwest;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::OnceLock,
@@ -146,10 +144,7 @@ pub async fn create_directory(
             .send()
             .await?;
 
-    Ok(response
-        .error_for_status()?
-        .json::<RemoteMetadata>()
-        .await?)
+    response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
 // Sends an empty file to the server
@@ -173,10 +168,7 @@ pub async fn create_file(
         .send()
         .await?;
 
-    Ok(response
-        .error_for_status()?
-        .json::<RemoteMetadata>()
-        .await?)
+    response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
 // Sends a chunk of bytes to the server at a specific offset
@@ -205,10 +197,7 @@ pub async fn write_file(
         .send()
         .await?;
 
-    Ok(response
-        .error_for_status()?
-        .json::<RemoteMetadata>()
-        .await?)
+    response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
 // Asks the server to resize a file without sending file contents.
@@ -231,10 +220,7 @@ pub async fn resize_file(
         .send()
         .await?;
 
-    Ok(response
-        .error_for_status()?
-        .json::<RemoteMetadata>()
-        .await?)
+    response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
 pub async fn update_metadata(
@@ -257,10 +243,7 @@ pub async fn update_metadata(
             .send()
             .await?;
 
-    Ok(response
-        .error_for_status()?
-        .json::<RemoteMetadata>()
-        .await?)
+    response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
 pub async fn delete_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
@@ -269,6 +252,20 @@ pub async fn delete_file(base_url: &str, path: &str) -> Result<(), reqwest::Erro
     let request_url = format!("{}/files/{}", normalized_base, normalized_path);
 
     log::debug!("API: Deleting {}", request_url);
+
+    let client = http_client();
+    let response = client.delete(&request_url).send().await?;
+
+    response.error_for_status()?;
+    Ok(())
+}
+
+pub async fn delete_directory(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
+    let normalized_base = base_url.trim_end_matches('/');
+    let normalized_path = path.trim_start_matches('/');
+    let request_url = format!("{}/directories/{}", normalized_base, normalized_path);
+
+    log::debug!("API: Deleting directory {}", request_url);
 
     let client = http_client();
     let response = client.delete(&request_url).send().await?;

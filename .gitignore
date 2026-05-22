@@ -3,6 +3,7 @@
 debug/
 target/
 remote-storage/
+test_folder/
 client/test_folder/
 .DS_Store
 

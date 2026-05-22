@@ -1,6 +1,6 @@
 use super::{
     HandleKind, RemoteFs, TTL, api, apply_umask, attr_from_remote_metadata, errno_from_api_error,
-    time_or_now,
+    errno_from_rmdir_error, time_or_now,
 };
 use fuser::{
     FUSE_ROOT_ID, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -248,12 +248,12 @@ impl Filesystem for RemoteFs {
         // 2. Check the local inode cache first, but only while metadata is fresh.
         {
             let path_to_inode_map = self.path_to_inode.lock().unwrap();
-            if let Some(&ino) = path_to_inode_map.get(&full_path) {
-                if let Some(attr) = self.fresh_attr_for_inode(ino) {
-                    debug!("CACHE HIT: Found attr for path {}: {:?}", full_path, attr);
-                    reply.entry(&TTL, &attr, 0);
-                    return;
-                }
+            if let Some(&ino) = path_to_inode_map.get(&full_path)
+                && let Some(attr) = self.fresh_attr_for_inode(ino)
+            {
+                debug!("CACHE HIT: Found attr for path {}: {:?}", full_path, attr);
+                reply.entry(&TTL, &attr, 0);
+                return;
             }
         }
 
@@ -572,13 +572,12 @@ impl Filesystem for RemoteFs {
         debug!("unlink(parent={}, path='{}')", parent, full_path);
 
         // `unlink` must reject directories; those should go through `rmdir`.
-        if let Some(ino) = self.path_to_inode.lock().unwrap().get(&full_path).copied() {
-            if let Some(attr) = self.inode_map.lock().unwrap().get(&ino) {
-                if attr.attr.kind == FileType::Directory {
-                    reply.error(libc::EISDIR);
-                    return;
-                }
-            }
+        if let Some(ino) = self.path_to_inode.lock().unwrap().get(&full_path).copied()
+            && let Some(attr) = self.inode_map.lock().unwrap().get(&ino)
+            && attr.attr.kind == FileType::Directory
+        {
+            reply.error(libc::EISDIR);
+            return;
         }
 
         let api_path = full_path.trim_start_matches('/');
@@ -610,19 +609,18 @@ impl Filesystem for RemoteFs {
         debug!("rmdir(parent={}, path='{}')", parent, full_path);
 
         // `rmdir` must reject regular files; those should go through `unlink`.
-        if let Some(ino) = self.path_to_inode.lock().unwrap().get(&full_path).copied() {
-            if let Some(attr) = self.inode_map.lock().unwrap().get(&ino) {
-                if attr.attr.kind != FileType::Directory {
-                    reply.error(libc::ENOTDIR);
-                    return;
-                }
-            }
+        if let Some(ino) = self.path_to_inode.lock().unwrap().get(&full_path).copied()
+            && let Some(attr) = self.inode_map.lock().unwrap().get(&ino)
+            && attr.attr.kind != FileType::Directory
+        {
+            reply.error(libc::ENOTDIR);
+            return;
         }
 
         let api_path = full_path.trim_start_matches('/');
         match self
             .runtime
-            .block_on(api::delete_file(&self.server_addr, api_path))
+            .block_on(api::delete_directory(&self.server_addr, api_path))
         {
             Ok(_) => {
                 self.remove_cached_path(&full_path);
@@ -633,7 +631,7 @@ impl Filesystem for RemoteFs {
                     "Failed to delete directory {} on server: {:?}",
                     api_path, err
                 );
-                reply.error(errno_from_api_error(&err));
+                reply.error(errno_from_rmdir_error(&err));
             }
         }
     }

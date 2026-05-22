@@ -12,7 +12,7 @@ use axum::{
     extract::{Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -486,6 +486,7 @@ fn build_app(shared_state: Arc<AppState>) -> Router {
             "/files/*path",
             get(get_file).put(write_file).delete(delete_path),
         )
+        .route("/directories/*path", delete(delete_directory))
         .route("/metadata/*path", patch(update_metadata))
         .route("/mkdir/*path", post(make_directory))
         .route("/rename", post(rename_entry))
@@ -595,6 +596,7 @@ async fn write_file(
     let mut body_stream = body.into_data_stream();
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&file_path)
@@ -678,7 +680,7 @@ async fn update_metadata(
     Ok((StatusCode::OK, Json(metadata)))
 }
 
-// Handler for `DELETE /files/*path`: removes a file or a full directory tree.
+// Handler for `DELETE /files/*path`: removes a file.
 async fn delete_path(
     AxumPath(path): AxumPath<String>,
     State(state): State<Arc<AppState>>,
@@ -688,17 +690,36 @@ async fn delete_path(
         .await
         .map_err(|error| StorageError::from_io(error, "Path not found"))?;
 
-    if metadata.is_dir() {
-        fs::remove_dir_all(&target_path)
-            .await
-            .map_err(|error| StorageError::from_io(error, "Could not remove directory"))?;
-        log::info!("Deleted directory /{}", path.trim_matches('/'));
-    } else {
-        fs::remove_file(&target_path)
-            .await
-            .map_err(|error| StorageError::from_io(error, "Could not remove file"))?;
-        log::info!("Deleted file /{}", path.trim_matches('/'));
+    if !metadata.is_file() {
+        return Err(StorageError::BadRequest("Path is not a file"));
     }
+
+    fs::remove_file(&target_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not remove file"))?;
+    log::info!("Deleted file /{}", path.trim_matches('/'));
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// Handler for `DELETE /directories/*path`: removes an empty directory.
+async fn delete_directory(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, StorageError> {
+    let target_path = state.resolve_non_root_path(&path)?;
+    let metadata = fs::metadata(&target_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Path not found"))?;
+
+    if !metadata.is_dir() {
+        return Err(StorageError::BadRequest("Path is not a directory"));
+    }
+
+    fs::remove_dir(&target_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not remove directory"))?;
+    log::info!("Deleted directory /{}", path.trim_matches('/'));
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -724,18 +745,6 @@ async fn rename_entry(
         fs::create_dir_all(parent)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not create parent directory"))?;
-    }
-
-    if let Ok(to_metadata) = fs::metadata(&to_path).await {
-        if to_metadata.is_dir() {
-            fs::remove_dir_all(&to_path)
-                .await
-                .map_err(|error| StorageError::from_io(error, "Could not replace directory"))?;
-        } else {
-            fs::remove_file(&to_path)
-                .await
-                .map_err(|error| StorageError::from_io(error, "Could not replace file"))?;
-        }
     }
 
     fs::rename(&from_path, &to_path)
