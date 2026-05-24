@@ -49,7 +49,7 @@ The server can be implemented using any language or framework, but should be RES
 ### Platform Support
 
 ✅ Linux – Full support using FUSE (libfuse, fuser, or async-fuse)\
-⚪ macOS – Optional support using macFUSE (best effort, no guarantee of full stability)\
+✅ macOS – Optional support using macFUSE (best effort, no guarantee of full stability)\
 ⚪ Windows – Optional support using WinFSP or Dokany with C bindings (lower priority)
 
 ### Performance
