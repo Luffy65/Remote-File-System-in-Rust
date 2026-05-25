@@ -1,6 +1,6 @@
 use super::{
-    HandleKind, RemoteFs, TTL, api, apply_umask, attr_from_remote_metadata, errno_from_api_error,
-    errno_from_rmdir_error, time_or_now,
+    HandleKind, RemoteFs, TRANSFER_IO_SIZE, TTL, api, apply_umask, attr_from_remote_metadata,
+    errno_from_api_error, errno_from_rmdir_error, time_or_now,
 };
 use fuser::{
     FUSE_ROOT_ID, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -15,8 +15,18 @@ use std::time::SystemTime;
 // FUSE callbacks translate kernel operations into HTTP API calls and keep
 // RemoteFs' local inode/path caches coherent after each successful mutation.
 impl Filesystem for RemoteFs {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut fuser::KernelConfig) -> Result<(), c_int> {
-        info!("Filesystem init method called.");
+    fn init(&mut self, _req: &Request<'_>, config: &mut fuser::KernelConfig) -> Result<(), c_int> {
+        if let Err(limit) = config.set_max_write(TRANSFER_IO_SIZE) {
+            let _ = config.set_max_write(limit);
+        }
+        if let Err(limit) = config.set_max_readahead(TRANSFER_IO_SIZE) {
+            let _ = config.set_max_readahead(limit);
+        }
+
+        info!(
+            "Filesystem init method called. Requested max I/O size: {} bytes.",
+            TRANSFER_IO_SIZE
+        );
         Ok(())
     }
 

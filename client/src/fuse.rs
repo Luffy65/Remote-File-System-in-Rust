@@ -15,6 +15,7 @@ use crate::cache::TtlLruCache;
 mod ops;
 
 const TTL: Duration = Duration::from_secs(1); // Kernel attribute TTL.
+const TRANSFER_IO_SIZE: u32 = 4 * 1024 * 1024;
 const ATTR_CACHE_TTL: Duration = Duration::from_secs(5);
 const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(5);
 const DIRECTORY_CACHE_MAX_ENTRIES: usize = 256;

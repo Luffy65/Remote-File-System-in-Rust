@@ -40,6 +40,7 @@ use std::os::unix::{
 };
 
 const DEFAULT_STORAGE_ROOT: &str = "remote-storage";
+const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 #[cfg(not(unix))]
 const DEFAULT_FILE_MODE: u32 = 0o644;
 #[cfg(not(unix))]
@@ -565,7 +566,7 @@ async fn get_file(
         offset,
         response_size
     );
-    let stream = ReaderStream::new(file.take(response_size));
+    let stream = ReaderStream::with_capacity(file.take(response_size), TRANSFER_BUFFER_SIZE);
 
     Ok((StatusCode::OK, Body::from_stream(stream)).into_response())
 }
@@ -618,6 +619,7 @@ async fn write_file(
     }
 
     let mut bytes_written = 0;
+    let mut write_buffer = Vec::with_capacity(TRANSFER_BUFFER_SIZE);
 
     file.seek(SeekFrom::Start(offset))
         .await
@@ -626,7 +628,24 @@ async fn write_file(
     while let Some(chunk) = body_stream.next().await {
         let chunk = chunk.map_err(|_| StorageError::RequestBody("Could not read request body"))?;
         bytes_written += chunk.len();
-        file.write_all(&chunk)
+        if write_buffer.len() + chunk.len() > TRANSFER_BUFFER_SIZE && !write_buffer.is_empty() {
+            file.write_all(&write_buffer)
+                .await
+                .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
+            write_buffer.clear();
+        }
+
+        if chunk.len() >= TRANSFER_BUFFER_SIZE {
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
+        } else {
+            write_buffer.extend_from_slice(&chunk);
+        }
+    }
+
+    if !write_buffer.is_empty() {
+        file.write_all(&write_buffer)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not write file"))?;
     }
