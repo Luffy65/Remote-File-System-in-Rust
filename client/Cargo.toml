@@ -4,15 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fuser = { version = "0.15.1", default-features = false }
 serde = { version = "1.0", features = ["derive"] } # JSON serialization/deserialization for the API
 env_logger = "0.11" # Logging during development
 log = "0.4"
-libc = "0.2" # Error constants such as ENOENT and EIO
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] } # HTTP calls and JSON handling
 
 tokio = { version = "1.0", features = ["full"] }
 
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+fuser = { version = "0.15.1", default-features = false }
+libc = "0.2" # Error constants such as ENOENT and EIO
+
 # Need this for macOS
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser = { version = "0.15.1", default-features = false, features = ["libfuse"] }
+libc = "0.2" # Error constants such as ENOENT and EIO
+
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13.0", default-features = false, features = ["system"] }
+winfsp-sys = "0.12"

@@ -48,9 +48,9 @@ The server can be implemented using any language or framework, but should be RES
 
 ### Platform Support
 
-✅ Linux – Full support using FUSE (libfuse, fuser, or async-fuse)\
-✅ macOS – Optional support using macFUSE (best effort, no guarantee of full stability)\
-⚪ Windows – Optional support using WinFSP or Dokany with C bindings (lower priority)
+✅ Linux – Full client/server support using FUSE\
+✅ macOS – Client support using macFUSE, plus server support\
+✅ Windows – Server support, plus experimental client support using WinFSP
 
 ### Performance
 
@@ -80,10 +80,17 @@ mkdir test_folder
 cargo run -p client -- --daemon test_folder http://127.0.0.1:3000
 ```
 
+On Windows, install WinFSP first and mount to a drive letter:
+
+```powershell
+cargo run -p client -- R: http://127.0.0.1:3000
+```
+
 If the client runs on another PC or VM, replace `127.0.0.1` with the server machine address.
+When the server runs on Windows, allow the server binary through Windows Firewall for TCP port 3000.
 
 The mounted directory can then be used with normal file commands such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
-When finished, unmount it with `fusermount -u test_folder` on Linux or `umount test_folder` on macOS.\
+When finished, unmount it with `fusermount -u test_folder` on Linux, `umount test_folder` on macOS, or Ctrl-C on Windows.\
 For foreground debugging, omit `--daemon`.
 
 ### Logs
