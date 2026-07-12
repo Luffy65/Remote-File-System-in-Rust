@@ -630,3 +630,33 @@ async fn test_metadata_patch_updates_modification_time() {
         .as_secs();
     assert_eq!(modified_at, REQUESTED_MTIME);
 }
+
+#[tokio::test]
+async fn test_metadata_get_returns_one_path_without_listing_parent() {
+    let root = TestRoot::new("metadata-get");
+    std::fs::create_dir(root.path.join("docs")).unwrap();
+    std::fs::write(root.path.join("docs/file.txt"), b"metadata").unwrap();
+    std::fs::write(root.path.join("docs/unrelated.txt"), b"other").unwrap();
+    let app = app_for_root(root.path());
+
+    let request = Request::builder()
+        .uri("/metadata/docs/file.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(metadata["type"], "file");
+    assert_eq!(metadata["size"], 8);
+    assert!(metadata.get("name").is_none());
+
+    let missing = Request::builder()
+        .uri("/metadata/docs/missing.txt")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(missing).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}

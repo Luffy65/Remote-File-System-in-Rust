@@ -33,6 +33,8 @@ The server should offer a set RESTful API for file operations:
 - GET /files/`path` – Read file contents
 - PUT /files/`path` – Write file contents
 - POST /mkdir/`path` – Create directory
+- GET /metadata/`path` – Read metadata for one file or directory
+- PATCH /metadata/`path` – Update supported metadata
 - DELETE /files/`path` – Delete file
 - DELETE /directories/`path` – Delete empty directory
 - POST /rename – Rename or move a file/directory
@@ -63,53 +65,97 @@ The server can be implemented using any language or framework, but should be RES
 
 ## Usage
 
-### Server
+### Choose the correct setup
 
-First, start the server. The current Rust server stores files on local disk under a configured storage root. Pass it as the first server argument, set `REMOTE_FS_ROOT`, or let it default to `./remote-storage`:
+| Setup | Server listen address | Authentication | Client URL |
+| --- | --- | --- | --- |
+| Client and server on the same machine | Default: `127.0.0.1:3000` | Not required | `http://127.0.0.1:3000` |
+| Client and server on different machines | `REMOTE_FS_ADDR=0.0.0.0:3000` | `REMOTE_FS_TOKEN` is required on both | `http://SERVER_LAN_IP:3000` |
+
+`127.0.0.1` always means "this machine." Do not use it in the client URL when the server runs on another computer. `0.0.0.0` is only a server bind address; never use it as the client destination.
+
+The server stores files under the path passed as its first argument, under `REMOTE_FS_ROOT`, or under `./remote-storage` by default.
+
+### A. Same-machine quick start
+
+Start the server:
 
 ```sh
 cargo run -p server -- ./remote-storage
 ```
 
-For safety, the server listens only on `127.0.0.1:3000` by default. Local clients do not require authentication.
-
-### Client
-
-In another terminal, create a mount point and start the client. If you are on Unix:
+Start a Linux/macOS client in another terminal:
 
 ```sh
 mkdir test_folder
-cargo run -p client -- --daemon test_folder http://127.0.0.1:3000
+cargo run -p client -- test_folder http://127.0.0.1:3000
 ```
 
-On Windows, install [WinFSP](https://winfsp.dev/rel/) before building the client. In the WinFSP installer, select the **Developer** component so that the required headers and libraries are installed. Building the Rust bindings also requires [LLVM/libclang](https://rust-lang.github.io/rust-bindgen/requirements.html); if it is not discovered automatically, set `LIBCLANG_PATH` to the LLVM `bin` directory containing `libclang.dll`. Then open a new terminal and mount the remote filesystem to a drive letter:
+Start a Windows client in another PowerShell terminal. Windows mounts must use a free drive letter such as `R:`, not a folder such as `test_folder`:
 
 ```powershell
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin" # Only needed when libclang is not auto-detected.
-cargo build -p client
 cargo run -p client -- R: http://127.0.0.1:3000
 ```
 
-If the client runs on another PC or VM, replace `127.0.0.1` with the server machine address.
+### B. LAN quick start: server on one machine, client on another
 
-### Authenticated remote access
+On a macOS/Linux server, bind to the LAN and choose a strong shared token:
 
-To accept remote clients, set a non-loopback listen address and a strong shared bearer token. The server refuses to start on a non-loopback address without a token:
+```sh
+export REMOTE_FS_ADDR="0.0.0.0:3000"
+export REMOTE_FS_TOKEN="replace-with-a-long-random-token"
+cargo run -p server -- ./remote-storage
+```
+
+On a Windows server, use the PowerShell equivalent:
 
 ```powershell
 $env:REMOTE_FS_ADDR = "0.0.0.0:3000"
 $env:REMOTE_FS_TOKEN = "replace-with-a-long-random-token"
-cargo run -p server -- ./remote-storage
+cargo run -p server -- .\remote-storage
 ```
 
-Set the same token in the client terminal:
+The server refuses to start on a non-loopback address without `REMOTE_FS_TOKEN`. Allow incoming TCP port 3000 if the operating-system firewall prompts you.
+
+On the Windows client, first verify that the server machine and port are reachable. Replace `192.168.1.19` with the server's actual LAN address:
+
+```powershell
+ping.exe 192.168.1.19
+Test-NetConnection 192.168.1.19 -Port 3000
+```
+
+`TcpTestSucceeded` must be `True`. If ping works but the TCP test fails, verify the server bind address and firewall. On macOS/Linux, confirm that the server is listening on all interfaces:
+
+```sh
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+```
+
+The output should show `*:3000` or `0.0.0.0:3000`, not only `127.0.0.1:3000`.
+
+Set the same token on the Windows client, verify the API, and mount a free drive letter:
 
 ```powershell
 $env:REMOTE_FS_TOKEN = "replace-with-a-long-random-token"
-cargo run -p client -- R: http://SERVER_ADDRESS:3000
+Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:REMOTE_FS_TOKEN" } http://192.168.1.19:3000/list/
+cargo run -p client -- R: http://192.168.1.19:3000
 ```
 
-The built-in server uses plain HTTP, so a bearer token protects access but not network confidentiality. Across an untrusted network, place the server behind TLS, an SSH tunnel, or a VPN. When the server runs on Windows, allow TCP port 3000 through Windows Firewall only for the networks and machines that need access.
+For the first run, keep the client in the foreground so errors remain visible. After it works, add `--daemon` before the drive letter:
+
+```powershell
+cargo run -p client -- --daemon R: http://192.168.1.19:3000
+```
+
+### Windows client prerequisites
+
+Install [WinFSP](https://winfsp.dev/rel/) and select the **Developer** component. Building the Rust bindings also requires [LLVM/libclang](https://rust-lang.github.io/rust-bindgen/requirements.html). If `libclang.dll` is not discovered automatically, set `LIBCLANG_PATH` to the LLVM `bin` directory:
+
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+cargo build -p client
+```
+
+The built-in server uses plain HTTP, so a bearer token controls access but does not encrypt network traffic. Across an untrusted network, place the server behind TLS, an SSH tunnel, or a VPN.
 
 The mounted directory can then be used with normal file commands such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
 When finished, unmount it with `fusermount -u test_folder` on Linux, `umount test_folder` on macOS, or Ctrl-C on Windows.\

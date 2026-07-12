@@ -1,11 +1,11 @@
 use crate::api::{self, DirectoryEntry, RemoteMetadata};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     ffi::{OsStr, c_void},
     hash::{Hash, Hasher},
     io::ErrorKind,
     sync::Mutex,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use winfsp::{
     FspError, Result, U16CStr,
@@ -26,6 +26,8 @@ const SECTOR_SIZE: u64 = 4096;
 const UNIX_EPOCH_AS_FILETIME_SECS: u64 = 11_644_473_600;
 const STATUS_UNEXPECTED_IO_ERROR: i32 = 0xC000_00E9u32 as i32;
 const ERROR_DIR_NOT_EMPTY: u32 = 145;
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(1);
+const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryKind {
@@ -33,7 +35,7 @@ enum EntryKind {
     Directory,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RemoteEntry {
     kind: EntryKind,
     size: u64,
@@ -41,9 +43,16 @@ struct RemoteEntry {
     mode: Option<u32>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedRemoteEntry {
+    entry: RemoteEntry,
+    cached_at: Instant,
+}
+
 struct WinHandle {
     path: Mutex<String>,
     kind: EntryKind,
+    entry: Mutex<RemoteEntry>,
     delete_on_cleanup: Mutex<bool>,
     dir_buffer: DirBuffer,
 }
@@ -51,6 +60,7 @@ struct WinHandle {
 struct RemoteWinFs {
     server_addr: String,
     runtime: tokio::runtime::Runtime,
+    metadata_cache: Mutex<HashMap<String, CachedRemoteEntry>>,
 }
 
 pub fn run(
@@ -61,6 +71,7 @@ pub fn run(
     let fs = RemoteWinFs {
         server_addr: server_url.to_string(),
         runtime: tokio::runtime::Runtime::new()?,
+        metadata_cache: Mutex::new(HashMap::new()),
     };
 
     let mut volume = VolumeParams::new();
@@ -123,10 +134,11 @@ impl RemoteEntry {
 }
 
 impl WinHandle {
-    fn new(path: String, kind: EntryKind) -> Self {
+    fn new(path: String, entry: RemoteEntry) -> Self {
         WinHandle {
             path: Mutex::new(path),
-            kind,
+            kind: entry.kind,
+            entry: Mutex::new(entry),
             delete_on_cleanup: Mutex::new(false),
             dir_buffer: DirBuffer::new(),
         }
@@ -134,6 +146,14 @@ impl WinHandle {
 
     fn path(&self) -> String {
         self.path.lock().unwrap().clone()
+    }
+
+    fn entry(&self) -> RemoteEntry {
+        self.entry.lock().unwrap().clone()
+    }
+
+    fn update_entry(&self, entry: RemoteEntry) {
+        *self.entry.lock().unwrap() = entry;
     }
 }
 
@@ -146,25 +166,57 @@ impl RemoteWinFs {
         path.trim_start_matches('/')
     }
 
+    fn cached_metadata(&self, path: &str) -> Option<RemoteEntry> {
+        let mut cache = self.metadata_cache.lock().unwrap();
+        if let Some(cached) = cache.get(path)
+            && cached.cached_at.elapsed() <= METADATA_CACHE_TTL
+        {
+            return Some(cached.entry.clone());
+        }
+        cache.remove(path);
+        None
+    }
+
+    fn cache_metadata(&self, path: &str, entry: &RemoteEntry) {
+        let mut cache = self.metadata_cache.lock().unwrap();
+        if cache.len() >= METADATA_CACHE_MAX_ENTRIES {
+            cache.retain(|_, cached| cached.cached_at.elapsed() <= METADATA_CACHE_TTL);
+            if cache.len() >= METADATA_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            path.to_string(),
+            CachedRemoteEntry {
+                entry: entry.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    fn invalidate_metadata_tree(&self, path: &str) {
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .retain(|cached_path, _| cached_path != path && !cached_path.starts_with(&prefix));
+    }
+
     fn metadata_for_path(&self, path: &str) -> Result<RemoteEntry> {
         if path == "/" {
             return Ok(RemoteEntry::root());
         }
 
-        let parent = parent_path(path);
-        let name = file_name(path).ok_or(FspError::IO(ErrorKind::InvalidInput))?;
-        let entries = self
-            .block_on(api::list_directory(
-                &self.server_addr,
-                Self::api_path(&parent),
-            ))
-            .map_err(|error| fsp_error_from_api(&error))?;
+        if let Some(entry) = self.cached_metadata(path) {
+            return Ok(entry);
+        }
 
-        entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(RemoteEntry::from_directory_entry)
-            .ok_or(FspError::IO(ErrorKind::NotFound))
+        let metadata = self
+            .block_on(api::get_metadata(&self.server_addr, Self::api_path(path)))
+            .map_err(|error| fsp_error_from_api(&error))?;
+        let entry = RemoteEntry::from_metadata(&metadata);
+        self.cache_metadata(path, &entry);
+        Ok(entry)
     }
 
     fn fill_file_info_for_path(&self, path: &str, info: &mut FileInfo) -> Result<RemoteEntry> {
@@ -175,14 +227,18 @@ impl RemoteWinFs {
 
     fn delete_path(&self, path: &str, kind: EntryKind) -> Result<()> {
         let api_path = Self::api_path(path);
-        match kind {
+        let result = match kind {
             EntryKind::File => self
                 .block_on(api::delete_file(&self.server_addr, api_path))
                 .map_err(|error| fsp_error_from_api(&error)),
             EntryKind::Directory => self
                 .block_on(api::delete_directory(&self.server_addr, api_path))
                 .map_err(|error| fsp_error_from_api(&error)),
+        };
+        if result.is_ok() {
+            self.invalidate_metadata_tree(path);
         }
+        result
     }
 
     fn validate_delete(&self, path: &str, kind: EntryKind) -> Result<()> {
@@ -236,7 +292,7 @@ impl FileSystemContext for RemoteWinFs {
     ) -> Result<Self::FileContext> {
         let path = normalize_winfsp_path(file_name);
         let entry = self.fill_file_info_for_path(&path, file_info.as_mut())?;
-        Ok(WinHandle::new(path, entry.kind))
+        Ok(WinHandle::new(path, entry))
     }
 
     fn close(&self, _context: Self::FileContext) {}
@@ -271,8 +327,9 @@ impl FileSystemContext for RemoteWinFs {
             }
         };
         let entry = RemoteEntry::from_metadata(&metadata);
+        self.cache_metadata(&path, &entry);
         fill_file_info(file_info.as_mut(), &path, &entry);
-        Ok(WinHandle::new(path, entry.kind))
+        Ok(WinHandle::new(path, entry))
     }
 
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
@@ -289,14 +346,16 @@ impl FileSystemContext for RemoteWinFs {
     fn flush(&self, context: Option<&Self::FileContext>, file_info: &mut FileInfo) -> Result<()> {
         if let Some(context) = context {
             let path = context.path();
-            self.fill_file_info_for_path(&path, file_info)?;
+            fill_file_info(file_info, &path, &context.entry());
         }
         Ok(())
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
         let path = context.path();
-        self.fill_file_info_for_path(&path, file_info)?;
+        let entry = self.metadata_for_path(&path)?;
+        context.update_entry(entry.clone());
+        fill_file_info(file_info, &path, &entry);
         Ok(())
     }
 
@@ -323,7 +382,10 @@ impl FileSystemContext for RemoteWinFs {
                 mode,
             ))
             .map_err(|error| fsp_error_from_api(&error))?;
-        fill_file_info(file_info, &path, &RemoteEntry::from_metadata(&metadata));
+        let entry = RemoteEntry::from_metadata(&metadata);
+        context.update_entry(entry.clone());
+        self.cache_metadata(&path, &entry);
+        fill_file_info(file_info, &path, &entry);
         Ok(())
     }
 
@@ -350,7 +412,7 @@ impl FileSystemContext for RemoteWinFs {
                 .dir_buffer
                 .acquire(true, Some(entries.len() as u32 + 2))?;
 
-            let current = self.metadata_for_path(&path)?;
+            let current = context.entry();
             write_dir_entry(&lock, ".", &path, &current)?;
             let parent = parent_path(&path);
             let parent_entry = self.metadata_for_path(&parent)?;
@@ -358,12 +420,9 @@ impl FileSystemContext for RemoteWinFs {
 
             for entry in entries {
                 let child_path = child_path(&path, &entry.name);
-                write_dir_entry(
-                    &lock,
-                    &entry.name,
-                    &child_path,
-                    &RemoteEntry::from_directory_entry(&entry),
-                )?;
+                let remote_entry = RemoteEntry::from_directory_entry(&entry);
+                self.cache_metadata(&child_path, &remote_entry);
+                write_dir_entry(&lock, &entry.name, &child_path, &remote_entry)?;
             }
         }
 
@@ -388,7 +447,9 @@ impl FileSystemContext for RemoteWinFs {
         ))
         .map_err(|error| fsp_error_from_api(&error))?;
 
-        *context.path.lock().unwrap() = to;
+        self.metadata_cache.lock().unwrap().clear();
+        *context.path.lock().unwrap() = to.clone();
+        self.cache_metadata(&to, &context.entry());
         Ok(())
     }
 
@@ -415,9 +476,12 @@ impl FileSystemContext for RemoteWinFs {
                     mtime,
                 ))
                 .map_err(|error| fsp_error_from_api(&error))?;
-            fill_file_info(file_info, &path, &RemoteEntry::from_metadata(&metadata));
+            let entry = RemoteEntry::from_metadata(&metadata);
+            context.update_entry(entry.clone());
+            self.cache_metadata(&path, &entry);
+            fill_file_info(file_info, &path, &entry);
         } else {
-            self.fill_file_info_for_path(&path, file_info)?;
+            fill_file_info(file_info, &path, &context.entry());
         }
         Ok(())
     }
@@ -443,7 +507,8 @@ impl FileSystemContext for RemoteWinFs {
         file_info: &mut FileInfo,
     ) -> Result<()> {
         if set_allocation_size {
-            self.fill_file_info_for_path(&context.path(), file_info)?;
+            let path = context.path();
+            fill_file_info(file_info, &path, &context.entry());
             return Ok(());
         }
 
@@ -455,7 +520,10 @@ impl FileSystemContext for RemoteWinFs {
                 new_size,
             ))
             .map_err(|error| fsp_error_from_api(&error))?;
-        fill_file_info(file_info, &path, &RemoteEntry::from_metadata(&metadata));
+        let entry = RemoteEntry::from_metadata(&metadata);
+        context.update_entry(entry.clone());
+        self.cache_metadata(&path, &entry);
+        fill_file_info(file_info, &path, &entry);
         Ok(())
     }
 
@@ -493,7 +561,14 @@ impl FileSystemContext for RemoteWinFs {
 
         let path = context.path();
         let offset = if write_to_eof {
-            self.metadata_for_path(&path)?.size
+            let metadata = self
+                .block_on(api::get_metadata(&self.server_addr, Self::api_path(&path)))
+                .map_err(|error| fsp_error_from_api(&error))?;
+            let entry = RemoteEntry::from_metadata(&metadata);
+            let size = entry.size;
+            context.update_entry(entry.clone());
+            self.cache_metadata(&path, &entry);
+            size
         } else {
             offset
         };
@@ -505,7 +580,10 @@ impl FileSystemContext for RemoteWinFs {
                 offset,
             ))
             .map_err(|error| fsp_error_from_api(&error))?;
-        fill_file_info(file_info, &path, &RemoteEntry::from_metadata(&metadata));
+        let entry = RemoteEntry::from_metadata(&metadata);
+        context.update_entry(entry.clone());
+        self.cache_metadata(&path, &entry);
+        fill_file_info(file_info, &path, &entry);
         Ok(buffer.len() as u32)
     }
 
@@ -554,14 +632,6 @@ fn parent_path(path: &str) -> String {
         Some((parent, _)) if !parent.is_empty() => format!("/{parent}"),
         _ => "/".to_string(),
     }
-}
-
-fn file_name(path: &str) -> Option<String> {
-    path.trim_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
 }
 
 fn child_path(parent: &str, name: &str) -> String {

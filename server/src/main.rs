@@ -14,7 +14,7 @@ use axum::{
     http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -614,7 +614,7 @@ fn build_app(shared_state: Arc<AppState>) -> Router {
             get(get_file).put(write_file).delete(delete_path),
         )
         .route("/directories/*path", delete(delete_directory))
-        .route("/metadata/*path", patch(update_metadata))
+        .route("/metadata/*path", get(get_metadata).patch(update_metadata))
         .route("/mkdir/*path", post(make_directory))
         .route("/rename", post(rename_entry))
         .with_state(shared_state)
@@ -823,6 +823,17 @@ async fn write_file(
     );
 
     Ok((StatusCode::OK, Json(metadata)).into_response())
+}
+
+// Handler for `GET /metadata/*path`: returns metadata for exactly one path.
+async fn get_metadata(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<EntryMetadata>, StorageError> {
+    let target_path = state.resolve_non_root_path(&path)?;
+    let metadata = entry_metadata_for_path(&target_path).await?;
+    log::debug!("Read metadata for /{}", path.trim_matches('/'));
+    Ok(Json(metadata))
 }
 
 // Handler for `PATCH /metadata/*path`: updates mode, owner, or modification time.

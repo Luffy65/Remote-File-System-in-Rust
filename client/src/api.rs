@@ -135,6 +135,19 @@ pub async fn list_directory(
     Ok(entries)
 }
 
+pub async fn get_metadata(base_url: &str, path: &str) -> Result<RemoteMetadata, reqwest::Error> {
+    let request_url = endpoint_url(base_url, "metadata", path);
+
+    log::debug!("Requesting metadata from URL: {}", request_url);
+
+    authenticated(http_client().get(&request_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await
+}
+
 // Requests only one byte range from the server instead of downloading the whole file.
 pub async fn read_file(
     base_url: &str,
