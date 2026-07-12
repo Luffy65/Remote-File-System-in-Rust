@@ -98,6 +98,13 @@ test "$(cat "$STORAGE_DIR/docs/hello.txt")" = "hello remote fs"
 mv "$MOUNT_DIR/docs/hello.txt" "$MOUNT_DIR/docs/renamed.txt"
 test "$(cat "$MOUNT_DIR/docs/renamed.txt")" = "hello remote fs"
 rm "$MOUNT_DIR/docs/renamed.txt"
+
+SPECIAL_REMOTE="$MOUNT_DIR/docs/hash# percent%.txt"
+printf 'special filename' >"$SPECIAL_REMOTE"
+test "$(cat "$SPECIAL_REMOTE")" = "special filename"
+test "$(cat "$STORAGE_DIR/docs/hash# percent%.txt")" = "special filename"
+rm "$SPECIAL_REMOTE"
+
 rmdir "$MOUNT_DIR/docs"
 test ! -e "$STORAGE_DIR/docs"
 

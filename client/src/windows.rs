@@ -25,6 +25,7 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const SECTOR_SIZE: u64 = 4096;
 const UNIX_EPOCH_AS_FILETIME_SECS: u64 = 11_644_473_600;
 const STATUS_UNEXPECTED_IO_ERROR: i32 = 0xC000_00E9u32 as i32;
+const ERROR_DIR_NOT_EMPTY: u32 = 145;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryKind {
@@ -47,7 +48,7 @@ struct WinHandle {
     dir_buffer: DirBuffer,
 }
 
-pub struct RemoteWinFs {
+struct RemoteWinFs {
     server_addr: String,
     runtime: tokio::runtime::Runtime,
 }
@@ -183,6 +184,28 @@ impl RemoteWinFs {
                 .map_err(|error| fsp_error_from_api(&error)),
         }
     }
+
+    fn validate_delete(&self, path: &str, kind: EntryKind) -> Result<()> {
+        if path == "/" {
+            return Err(FspError::IO(ErrorKind::PermissionDenied));
+        }
+
+        match kind {
+            EntryKind::File => {
+                self.metadata_for_path(path)?;
+            }
+            EntryKind::Directory => {
+                let entries = self
+                    .block_on(api::list_directory(&self.server_addr, Self::api_path(path)))
+                    .map_err(|error| fsp_error_from_api(&error))?;
+                if !entries.is_empty() {
+                    return Err(FspError::WIN32(ERROR_DIR_NOT_EMPTY));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl FileSystemContext for RemoteWinFs {
@@ -277,6 +300,33 @@ impl FileSystemContext for RemoteWinFs {
         Ok(())
     }
 
+    fn overwrite(
+        &self,
+        context: &Self::FileContext,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+        replace_file_attributes: bool,
+        _allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        file_info: &mut FileInfo,
+    ) -> Result<()> {
+        if context.kind != EntryKind::File {
+            return Err(FspError::IO(ErrorKind::IsADirectory));
+        }
+
+        let path = context.path();
+        let current = self.metadata_for_path(&path)?;
+        let mode = mode_after_overwrite(current.mode, file_attributes, replace_file_attributes);
+        let metadata = self
+            .block_on(api::overwrite_file(
+                &self.server_addr,
+                Self::api_path(&path),
+                mode,
+            ))
+            .map_err(|error| fsp_error_from_api(&error))?;
+        fill_file_info(file_info, &path, &RemoteEntry::from_metadata(&metadata));
+        Ok(())
+    }
+
     fn read_directory(
         &self,
         context: &Self::FileContext,
@@ -329,17 +379,12 @@ impl FileSystemContext for RemoteWinFs {
     ) -> Result<()> {
         let from = normalize_winfsp_path(file_name);
         let to = normalize_winfsp_path(new_file_name);
-        if let Ok(existing) = self.metadata_for_path(&to) {
-            if !replace_if_exists {
-                return Err(FspError::IO(ErrorKind::AlreadyExists));
-            }
-            self.delete_path(&to, existing.kind)?;
-        }
 
         self.block_on(api::rename_file(
             &self.server_addr,
             Self::api_path(&from),
             Self::api_path(&to),
+            replace_if_exists,
         ))
         .map_err(|error| fsp_error_from_api(&error))?;
 
@@ -383,6 +428,9 @@ impl FileSystemContext for RemoteWinFs {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> Result<()> {
+        if delete_file {
+            self.validate_delete(&context.path(), context.kind)?;
+        }
         *context.delete_on_cleanup.lock().unwrap() = delete_file;
         Ok(())
     }
@@ -544,6 +592,29 @@ fn file_attributes(entry: &RemoteEntry) -> u32 {
             FILE_ATTRIBUTE_ARCHIVE | if readonly { FILE_ATTRIBUTE_READONLY } else { 0 }
         }
     }
+}
+
+fn mode_after_overwrite(
+    current_mode: Option<u32>,
+    file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+    replace_file_attributes: bool,
+) -> Option<u32> {
+    let mut mode = current_mode.unwrap_or(0o644);
+    let currently_readonly = mode & 0o222 == 0;
+    let requested_readonly = file_attributes & FILE_ATTRIBUTE_READONLY != 0;
+    let readonly = if replace_file_attributes {
+        requested_readonly
+    } else {
+        currently_readonly || requested_readonly
+    };
+
+    if readonly {
+        mode &= !0o222;
+    } else {
+        mode |= 0o200;
+    }
+
+    Some(mode)
 }
 
 fn allocation_size(size: u64) -> u64 {

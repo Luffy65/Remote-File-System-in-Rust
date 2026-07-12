@@ -688,7 +688,7 @@ impl Filesystem for RemoteFs {
 
         match self
             .runtime
-            .block_on(api::rename_file(&self.server_addr, api_from, api_to))
+            .block_on(api::rename_file(&self.server_addr, api_from, api_to, true))
         {
             Ok(_) => {
                 self.rename_cached_path(&from_path, &to_path);

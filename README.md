@@ -71,23 +71,45 @@ First, start the server. The current Rust server stores files on local disk unde
 cargo run -p server -- ./remote-storage
 ```
 
+For safety, the server listens only on `127.0.0.1:3000` by default. Local clients do not require authentication.
+
 ### Client
 
-In another terminal, create a mount point and start the client:
+In another terminal, create a mount point and start the client. If you are on Unix:
 
 ```sh
 mkdir test_folder
 cargo run -p client -- --daemon test_folder http://127.0.0.1:3000
 ```
 
-On Windows, install WinFSP first and mount to a drive letter:
+On Windows, install [WinFSP](https://winfsp.dev/rel/) before building the client. In the WinFSP installer, select the **Developer** component so that the required headers and libraries are installed. Building the Rust bindings also requires [LLVM/libclang](https://rust-lang.github.io/rust-bindgen/requirements.html); if it is not discovered automatically, set `LIBCLANG_PATH` to the LLVM `bin` directory containing `libclang.dll`. Then open a new terminal and mount the remote filesystem to a drive letter:
 
 ```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin" # Only needed when libclang is not auto-detected.
+cargo build -p client
 cargo run -p client -- R: http://127.0.0.1:3000
 ```
 
 If the client runs on another PC or VM, replace `127.0.0.1` with the server machine address.
-When the server runs on Windows, allow the server binary through Windows Firewall for TCP port 3000.
+
+### Authenticated remote access
+
+To accept remote clients, set a non-loopback listen address and a strong shared bearer token. The server refuses to start on a non-loopback address without a token:
+
+```powershell
+$env:REMOTE_FS_ADDR = "0.0.0.0:3000"
+$env:REMOTE_FS_TOKEN = "replace-with-a-long-random-token"
+cargo run -p server -- ./remote-storage
+```
+
+Set the same token in the client terminal:
+
+```powershell
+$env:REMOTE_FS_TOKEN = "replace-with-a-long-random-token"
+cargo run -p client -- R: http://SERVER_ADDRESS:3000
+```
+
+The built-in server uses plain HTTP, so a bearer token protects access but not network confidentiality. Across an untrusted network, place the server behind TLS, an SSH tunnel, or a VPN. When the server runs on Windows, allow TCP port 3000 through Windows Firewall only for the networks and machines that need access.
 
 The mounted directory can then be used with normal file commands such as `ls`, `cat`, `mkdir`, `mv`, and `rm`.\
 When finished, unmount it with `fusermount -u test_folder` on Linux, `umount test_folder` on macOS, or Ctrl-C on Windows.\

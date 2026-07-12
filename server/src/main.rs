@@ -5,12 +5,14 @@
 // To run the server, navigate to the project root and run:
 // `cargo run -p server -- [STORAGE_ROOT]`
 //
-// The server will listen on `0.0.0.0:3000`.
+// The server listens on `127.0.0.1:3000` by default. Set `REMOTE_FS_ADDR`
+// and `REMOTE_FS_TOKEN` explicitly to serve authenticated remote clients.
 
 use axum::{
     body::Body,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
@@ -40,6 +42,7 @@ use std::os::unix::{
 };
 
 const DEFAULT_STORAGE_ROOT: &str = "remote-storage";
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:3000";
 const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 #[cfg(not(unix))]
 const DEFAULT_FILE_MODE: u32 = 0o644;
@@ -48,16 +51,22 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 
 struct AppState {
     root_dir: PathBuf,
+    auth_token: Option<String>,
 }
 
 impl AppState {
-    fn new(root_dir: PathBuf) -> Self {
-        AppState { root_dir }
+    fn with_auth(root_dir: PathBuf, auth_token: Option<String>) -> Self {
+        AppState {
+            root_dir,
+            auth_token,
+        }
     }
 
-    // Resolves an API path below the storage root and rejects traversal like `..`.
+    // Resolves an API path below the storage root and rejects traversal like `..`
+    // as well as symlink/reparse-point components that could escape the root.
     fn resolve_path(&self, path: &str) -> Result<PathBuf, StorageError> {
         let relative_path = sanitize_api_path(path)?;
+        self.reject_link_components(&relative_path)?;
         Ok(self.root_dir.join(relative_path))
     }
 
@@ -69,8 +78,53 @@ impl AppState {
             return Err(StorageError::BadRequest("Path cannot be empty"));
         }
 
+        self.reject_link_components(&relative_path)?;
         Ok(self.root_dir.join(relative_path))
     }
+
+    fn reject_link_components(&self, relative_path: &Path) -> Result<(), StorageError> {
+        let mut current = self.root_dir.clone();
+
+        for component in relative_path.components() {
+            let Component::Normal(part) = component else {
+                return Err(StorageError::BadRequest("Invalid path"));
+            };
+            current.push(part);
+
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if is_link_or_reparse_point(&metadata) => {
+                    return Err(StorageError::Forbidden(
+                        "Symbolic links and reparse points are not allowed",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(StorageError::from_io(error, "Could not inspect path"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[derive(Debug)]
@@ -120,6 +174,12 @@ impl IntoResponse for StorageError {
 struct RenameRequest {
     from: String,
     to: String,
+    #[serde(default = "replace_if_exists_by_default")]
+    replace_if_exists: bool,
+}
+
+fn replace_if_exists_by_default() -> bool {
+    true
 }
 
 /// Represents a directory entry (file or directory).
@@ -164,6 +224,47 @@ fn sanitize_api_path(path: &str) -> Result<PathBuf, StorageError> {
     }
 
     Ok(relative_path)
+}
+
+fn bearer_token_matches(header_value: &str, expected_token: &str) -> bool {
+    let Some(provided_token) = header_value.strip_prefix("Bearer ") else {
+        return false;
+    };
+
+    let provided = provided_token.as_bytes();
+    let expected = expected_token.as_bytes();
+    let mut difference = provided.len() ^ expected.len();
+    let comparison_len = provided.len().max(expected.len());
+
+    for index in 0..comparison_len {
+        difference |= usize::from(
+            provided.get(index).copied().unwrap_or(0) ^ expected.get(index).copied().unwrap_or(0),
+        );
+    }
+
+    difference == 0
+}
+
+async fn require_authentication(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(expected_token) = state.auth_token.as_deref() else {
+        return next.run(request).await;
+    };
+
+    let authorized = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| bearer_token_matches(value, expected_token));
+
+    if authorized {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "Missing or invalid bearer token").into_response()
+    }
 }
 
 // Formats modification time as seconds since the Unix epoch.
@@ -391,7 +492,30 @@ fn timespec_from_system_time(time: SystemTime) -> libc::timespec {
 }
 
 fn apply_modified_time(path: &Path, modified_at: u64) -> Result<(), StorageError> {
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::fs::{FileTimes, OpenOptions as StdOpenOptions};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        let requested_time = UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(modified_at))
+            .ok_or(StorageError::BadRequest(
+                "Modification time is out of range",
+            ))?;
+        let file = StdOpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|error| StorageError::from_io(error, "Could not open path"))?;
+
+        file.set_times(FileTimes::new().set_modified(requested_time))
+            .map_err(|error| StorageError::from_io(error, "Could not update modification time"))?;
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
     let _ = (path, modified_at);
 
     #[cfg(unix)]
@@ -480,6 +604,8 @@ async fn list_entries(state: &AppState, path: &str) -> Result<Vec<DirectoryEntry
 
 // Builds the Axum router with all file-system endpoints wired to shared state.
 fn build_app(shared_state: Arc<AppState>) -> Router {
+    let authentication_state = shared_state.clone();
+
     Router::new()
         .route("/list/", get(list_root))
         .route("/list/*path", get(list_path))
@@ -492,6 +618,10 @@ fn build_app(shared_state: Arc<AppState>) -> Router {
         .route("/mkdir/*path", post(make_directory))
         .route("/rename", post(rename_entry))
         .with_state(shared_state)
+        .layer(middleware::from_fn_with_state(
+            authentication_state,
+            require_authentication,
+        ))
 }
 
 // Reads the storage root from the first CLI argument, then env, then a default.
@@ -501,6 +631,20 @@ fn configured_storage_root() -> PathBuf {
         .or_else(|| env::var("REMOTE_FS_ROOT").ok())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_ROOT))
+}
+
+fn configured_listen_addr() -> Result<SocketAddr, String> {
+    let value = env::var("REMOTE_FS_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_string());
+    value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("Invalid REMOTE_FS_ADDR '{value}': {error}"))
+}
+
+fn configured_auth_token() -> Option<String> {
+    env::var("REMOTE_FS_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
 // Handler for `POST /mkdir/*path`: creates a directory on disk.
@@ -750,6 +894,11 @@ async fn rename_entry(
 ) -> Result<impl IntoResponse, StorageError> {
     let from_path = state.resolve_non_root_path(&payload.from)?;
     let to_path = state.resolve_non_root_path(&payload.to)?;
+
+    if from_path == to_path {
+        return Ok(StatusCode::OK);
+    }
+
     let from_metadata = fs::metadata(&from_path)
         .await
         .map_err(|error| StorageError::from_io(error, "Source path not found"))?;
@@ -758,6 +907,19 @@ async fn rename_entry(
         return Err(StorageError::BadRequest(
             "Cannot move a directory inside itself",
         ));
+    }
+
+    if !payload.replace_if_exists {
+        match fs::symlink_metadata(&to_path).await {
+            Ok(_) => return Err(StorageError::Conflict("Destination path already exists")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(StorageError::from_io(
+                    error,
+                    "Could not inspect destination path",
+                ));
+            }
+        }
     }
 
     if let Some(parent) = to_path.parent() {
@@ -825,11 +987,27 @@ async fn main() {
     std::fs::create_dir_all(&storage_root).expect("Failed to create storage root");
     let storage_root =
         std::fs::canonicalize(&storage_root).expect("Failed to resolve storage root");
+    let addr = configured_listen_addr().unwrap_or_else(|error| panic!("{error}"));
+    let auth_token = configured_auth_token();
 
-    let app = build_app(Arc::new(AppState::new(storage_root.clone())));
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    if !addr.ip().is_loopback() && auth_token.is_none() {
+        panic!("REMOTE_FS_TOKEN must be set when REMOTE_FS_ADDR listens on a non-loopback address");
+    }
+
+    let app = build_app(Arc::new(AppState::with_auth(
+        storage_root.clone(),
+        auth_token.clone(),
+    )));
     log::info!("Server storage root: {}", storage_root.display());
     log::info!("Server listening on {}", addr);
+    log::info!(
+        "Bearer-token authentication: {}",
+        if auth_token.is_some() {
+            "enabled"
+        } else {
+            "disabled (loopback only)"
+        }
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app)

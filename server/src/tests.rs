@@ -39,7 +39,11 @@ impl Drop for TestRoot {
 }
 
 fn app_for_root(root: PathBuf) -> Router {
-    build_app(Arc::new(AppState::new(root)))
+    build_app(Arc::new(AppState::with_auth(root, None)))
+}
+
+fn app_for_root_with_token(root: PathBuf, token: &str) -> Router {
+    build_app(Arc::new(AppState::with_auth(root, Some(token.to_string()))))
 }
 
 #[tokio::test]
@@ -439,9 +443,190 @@ async fn test_written_file_survives_new_router_with_same_root() {
 fn test_path_traversal_is_rejected() {
     // 1. Build state with any root; validation should reject before disk access.
     let root = TestRoot::new("path-validation");
-    let state = AppState::new(root.path());
+    let state = AppState::with_auth(root.path(), None);
 
     // 2. Ensure parent-directory components cannot escape the storage root.
     assert!(state.resolve_path("../Cargo.toml").is_err());
     assert!(state.resolve_path("docs/../../Cargo.toml").is_err());
+}
+
+#[test]
+fn test_link_components_are_rejected() {
+    let root = TestRoot::new("link-root");
+    let outside = TestRoot::new("link-outside");
+    std::fs::write(outside.path.join("secret.txt"), b"secret").unwrap();
+    let link = root.path.join("escape");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside.path, &link).unwrap();
+
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside.path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create test junction");
+    }
+
+    let state = AppState::with_auth(root.path(), None);
+    assert!(matches!(
+        state.resolve_path("escape/secret.txt"),
+        Err(StorageError::Forbidden(_))
+    ));
+
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(link).unwrap();
+}
+
+#[tokio::test]
+async fn test_bearer_token_authentication() {
+    let root = TestRoot::new("authentication");
+    let app = app_for_root_with_token(root.path(), "correct-token");
+
+    let missing = Request::builder()
+        .uri("/list/")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(missing).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let incorrect = Request::builder()
+        .uri("/list/")
+        .header("authorization", "Bearer wrong-token")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(incorrect).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let authorized = Request::builder()
+        .uri("/list/")
+        .header("authorization", "Bearer correct-token")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(authorized).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn test_percent_encoded_reserved_filename_round_trips() {
+    let root = TestRoot::new("encoded-filename");
+    let app = app_for_root(root.path());
+    let write = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/hash%23%20percent%25.txt")
+        .body(Body::from("encoded"))
+        .unwrap();
+
+    assert_eq!(
+        app.clone().oneshot(write).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        std::fs::read(root.path.join("hash# percent%.txt")).unwrap(),
+        b"encoded"
+    );
+
+    let read = Request::builder()
+        .uri("/files/hash%23%20percent%25.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(read).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"encoded"
+    );
+}
+
+#[tokio::test]
+async fn test_rename_respects_replace_if_exists() {
+    let root = TestRoot::new("rename-replace-semantics");
+    std::fs::write(root.path.join("source.txt"), b"source").unwrap();
+    std::fs::write(root.path.join("destination.txt"), b"destination").unwrap();
+    let app = app_for_root(root.path());
+
+    let reject_replace = Request::builder()
+        .method(Method::POST)
+        .uri("/rename")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "from": "source.txt",
+                "to": "destination.txt",
+                "replace_if_exists": false
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(reject_replace).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        std::fs::read(root.path.join("source.txt")).unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        std::fs::read(root.path.join("destination.txt")).unwrap(),
+        b"destination"
+    );
+
+    let allow_replace = Request::builder()
+        .method(Method::POST)
+        .uri("/rename")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "from": "source.txt",
+                "to": "destination.txt",
+                "replace_if_exists": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(allow_replace).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(!root.path.join("source.txt").exists());
+    assert_eq!(
+        std::fs::read(root.path.join("destination.txt")).unwrap(),
+        b"source"
+    );
+}
+
+#[tokio::test]
+async fn test_metadata_patch_updates_modification_time() {
+    const REQUESTED_MTIME: u64 = 946_684_800;
+
+    let root = TestRoot::new("metadata-mtime");
+    std::fs::write(root.path.join("mtime.txt"), b"mtime").unwrap();
+    let app = app_for_root(root.path());
+    let request = Request::builder()
+        .method(Method::PATCH)
+        .uri("/metadata/mtime.txt")
+        .header("X-File-Mtime", REQUESTED_MTIME.to_string())
+        .body(Body::empty())
+        .unwrap();
+
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    let modified_at = std::fs::metadata(root.path.join("mtime.txt"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(modified_at, REQUESTED_MTIME);
 }

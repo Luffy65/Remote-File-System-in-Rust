@@ -21,6 +21,7 @@ struct ClientArgs {
     mountpoint: String,
     server_url: String,
     spawn_daemon_mode: bool,
+    #[cfg(not(windows))]
     serve_daemon_mode: bool,
 }
 
@@ -48,8 +49,9 @@ fn parse_args() -> ClientArgs {
         server_url: args
             .get(mountpoint_index + 1)
             .cloned()
-            .unwrap_or_else(|| "http://localhost:3000".to_string()),
+            .unwrap_or_else(|| "http://127.0.0.1:3000".to_string()),
         spawn_daemon_mode,
+        #[cfg(not(windows))]
         serve_daemon_mode,
     }
 }

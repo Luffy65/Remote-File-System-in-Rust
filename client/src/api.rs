@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    fmt::Write,
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,7 +16,9 @@ pub struct DirectoryEntry {
     pub size: u64,
     pub modified_at: String,
     pub mode: Option<u32>,
+    #[cfg(not(windows))]
     pub uid: Option<u32>,
+    #[cfg(not(windows))]
     pub gid: Option<u32>,
 }
 
@@ -26,7 +29,9 @@ pub struct RemoteMetadata {
     pub size: u64,
     pub modified_at: String,
     pub mode: Option<u32>,
+    #[cfg(not(windows))]
     pub uid: Option<u32>,
+    #[cfg(not(windows))]
     pub gid: Option<u32>,
 }
 
@@ -39,6 +44,43 @@ fn http_client() -> &'static reqwest::Client {
             .build()
             .expect("failed to build HTTP client")
     })
+}
+
+fn authenticated(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("REMOTE_FS_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => request.bearer_auth(token.trim()),
+        _ => request,
+    }
+}
+
+fn encode_api_path(path: &str) -> String {
+    let normalized = path.trim_matches('/');
+    let mut encoded = String::with_capacity(normalized.len());
+
+    for (component_index, component) in normalized.split('/').enumerate() {
+        if component_index > 0 {
+            encoded.push('/');
+        }
+
+        for byte in component.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(char::from(byte));
+            } else {
+                write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+
+    encoded
+}
+
+fn endpoint_url(base_url: &str, endpoint: &str, path: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        base_url.trim_end_matches('/'),
+        endpoint,
+        encode_api_path(path)
+    )
 }
 
 fn unix_seconds_from_system_time(time: SystemTime) -> u64 {
@@ -77,18 +119,13 @@ pub async fn list_directory(
     base_url: &str,
     path: &str,
 ) -> Result<Vec<DirectoryEntry>, reqwest::Error> {
-    // Normalize path: remove leading slash if present, no trailing slash needed.
-    let normalized_path = path.trim_start_matches('/');
-    let path_segment = normalized_path.to_string();
-
-    // Normalize base_url: ensure it does not end with a slash before appending segments.
-    let normalized_base_url = base_url.trim_end_matches('/');
-
-    let request_url = format!("{}/list/{}", normalized_base_url, path_segment);
+    let request_url = endpoint_url(base_url, "list", path);
 
     log::debug!("Requesting directory list from URL: {}", request_url);
 
-    let response = http_client().get(&request_url).send().await?;
+    let response = authenticated(http_client().get(&request_url))
+        .send()
+        .await?;
     log::debug!("Received response: {:?}", response.status());
 
     let entries = response
@@ -105,9 +142,7 @@ pub async fn read_file(
     offset: u64,
     size: u32,
 ) -> Result<Vec<u8>, reqwest::Error> {
-    let normalized_base_url = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/files/{}", normalized_base_url, normalized_path);
+    let request_url = endpoint_url(base_url, "files", path);
 
     log::debug!(
         "Requesting file range from URL: {} (offset={}, size={})",
@@ -117,8 +152,7 @@ pub async fn read_file(
     );
 
     let client = http_client();
-    let response = client
-        .get(&request_url)
+    let response = authenticated(client.get(&request_url))
         .header("X-File-Offset", offset.to_string())
         .header("X-File-Size", size.to_string())
         .send()
@@ -134,17 +168,19 @@ pub async fn create_directory(
     path: &str,
     mode: u32,
 ) -> Result<RemoteMetadata, reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-
-    let request_url = format!("{}/mkdir/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "mkdir", path);
     log::debug!("Requesting directory creation: POST {}", request_url);
 
     let client = http_client();
-    let response =
-        add_optional_metadata_headers(client.post(&request_url), Some(mode), None, None, None)
-            .send()
-            .await?;
+    let response = add_optional_metadata_headers(
+        authenticated(client.post(&request_url)),
+        Some(mode),
+        None,
+        None,
+        None,
+    )
+    .send()
+    .await?;
 
     response.error_for_status()?.json::<RemoteMetadata>().await
 }
@@ -155,15 +191,12 @@ pub async fn create_file(
     path: &str,
     mode: u32,
 ) -> Result<RemoteMetadata, reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "files", path);
 
     log::debug!("API: Creating new empty file via PUT {}", request_url);
 
     let client = http_client();
-    let request = client
-        .put(&request_url)
+    let request = authenticated(client.put(&request_url))
         .header("X-File-Offset", "0")
         .body(vec![]);
     let response = add_optional_metadata_headers(request, Some(mode), None, None, None)
@@ -180,9 +213,7 @@ pub async fn write_file(
     data: &[u8],
     offset: u64,
 ) -> Result<RemoteMetadata, reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "files", path);
 
     log::debug!(
         "API: Writing {} bytes at offset {} to {}",
@@ -192,8 +223,7 @@ pub async fn write_file(
     );
 
     let client = http_client();
-    let response = client
-        .put(&request_url)
+    let response = authenticated(client.put(&request_url))
         .header("X-File-Offset", offset.to_string())
         .body(data.to_vec())
         .send()
@@ -208,17 +238,34 @@ pub async fn resize_file(
     path: &str,
     size: u64,
 ) -> Result<RemoteMetadata, reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "files", path);
 
     log::debug!("API: Resizing {} to {} bytes", request_url, size);
 
     let client = http_client();
-    let response = client
-        .put(&request_url)
+    let response = authenticated(client.put(&request_url))
         .header("X-File-Truncate", size.to_string())
         .body(vec![])
+        .send()
+        .await?;
+
+    response.error_for_status()?.json::<RemoteMetadata>().await
+}
+
+pub async fn overwrite_file(
+    base_url: &str,
+    path: &str,
+    mode: Option<u32>,
+) -> Result<RemoteMetadata, reqwest::Error> {
+    let request_url = endpoint_url(base_url, "files", path);
+
+    log::debug!("API: Overwriting {}", request_url);
+
+    let client = http_client();
+    let request = authenticated(client.put(&request_url))
+        .header("X-File-Truncate", "0")
+        .body(Vec::new());
+    let response = add_optional_metadata_headers(request, mode, None, None, None)
         .send()
         .await?;
 
@@ -233,44 +280,43 @@ pub async fn update_metadata(
     gid: Option<u32>,
     modified_at: Option<SystemTime>,
 ) -> Result<RemoteMetadata, reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/metadata/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "metadata", path);
 
     log::debug!("API: Updating metadata for {}", request_url);
 
     let client = http_client();
-    let response =
-        add_optional_metadata_headers(client.patch(&request_url), mode, uid, gid, modified_at)
-            .send()
-            .await?;
+    let response = add_optional_metadata_headers(
+        authenticated(client.patch(&request_url)),
+        mode,
+        uid,
+        gid,
+        modified_at,
+    )
+    .send()
+    .await?;
 
     response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
 pub async fn delete_file(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/files/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "files", path);
 
     log::debug!("API: Deleting {}", request_url);
 
     let client = http_client();
-    let response = client.delete(&request_url).send().await?;
+    let response = authenticated(client.delete(&request_url)).send().await?;
 
     response.error_for_status()?;
     Ok(())
 }
 
 pub async fn delete_directory(base_url: &str, path: &str) -> Result<(), reqwest::Error> {
-    let normalized_base = base_url.trim_end_matches('/');
-    let normalized_path = path.trim_start_matches('/');
-    let request_url = format!("{}/directories/{}", normalized_base, normalized_path);
+    let request_url = endpoint_url(base_url, "directories", path);
 
     log::debug!("API: Deleting directory {}", request_url);
 
     let client = http_client();
-    let response = client.delete(&request_url).send().await?;
+    let response = authenticated(client.delete(&request_url)).send().await?;
 
     response.error_for_status()?;
     Ok(())
@@ -280,9 +326,15 @@ pub async fn delete_directory(base_url: &str, path: &str) -> Result<(), reqwest:
 struct RenameRequest<'a> {
     from: &'a str,
     to: &'a str,
+    replace_if_exists: bool,
 }
 
-pub async fn rename_file(base_url: &str, from: &str, to: &str) -> Result<(), reqwest::Error> {
+pub async fn rename_file(
+    base_url: &str,
+    from: &str,
+    to: &str,
+    replace_if_exists: bool,
+) -> Result<(), reqwest::Error> {
     let normalized_base = base_url.trim_end_matches('/');
     let request_url = format!("{}/rename", normalized_base);
     let normalized_from = from.trim_start_matches('/');
@@ -296,15 +348,44 @@ pub async fn rename_file(base_url: &str, from: &str, to: &str) -> Result<(), req
     );
 
     let client = http_client();
-    let response = client
-        .post(&request_url)
+    let response = authenticated(client.post(&request_url))
         .json(&RenameRequest {
             from: normalized_from,
             to: normalized_to,
+            replace_if_exists,
         })
         .send()
         .await?;
 
     response.error_for_status()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_api_path, endpoint_url};
+
+    #[test]
+    fn api_paths_encode_reserved_and_unicode_characters_per_component() {
+        assert_eq!(
+            encode_api_path("/docs/hash# percent% question?.txt"),
+            "docs/hash%23%20percent%25%20question%3F.txt"
+        );
+        assert_eq!(
+            encode_api_path("caffè/東京.txt"),
+            "caff%C3%A8/%E6%9D%B1%E4%BA%AC.txt"
+        );
+    }
+
+    #[test]
+    fn endpoint_url_preserves_hierarchy_and_root_trailing_slash() {
+        assert_eq!(
+            endpoint_url("http://localhost:3000/", "files", "/a/b.txt"),
+            "http://localhost:3000/files/a/b.txt"
+        );
+        assert_eq!(
+            endpoint_url("http://localhost:3000", "list", ""),
+            "http://localhost:3000/list/"
+        );
+    }
 }
