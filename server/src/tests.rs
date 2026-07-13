@@ -47,6 +47,29 @@ fn app_for_root_with_token(root: PathBuf, token: &str) -> Router {
 }
 
 #[tokio::test]
+async fn test_successful_responses_advertise_protocol_version() {
+    let root = TestRoot::new("protocol-version");
+    let response = app_for_root(root.path())
+        .oneshot(
+            Request::builder()
+                .uri("/list/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(remote_fs_protocol::PROTOCOL_VERSION_HEADER)
+            .unwrap(),
+        remote_fs_protocol::PROTOCOL_VERSION
+    );
+}
+
+#[tokio::test]
 async fn test_conditional_put_atomically_creates_file() {
     let root = TestRoot::new("conditional-create");
     let app = app_for_root(root.path());

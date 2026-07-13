@@ -2,9 +2,8 @@
 
 ## Overview
 
-Remote File System in Rust, project for the API Programming course at Politecnico di Torino, 2024/2025.
+This project aims to implement a remote file system client and server in Rust. The client presents a local mount point, mirroring the structure of the file system hosted on a remote server. The file system supports transparent read and write access to remote files.
 
-This project aims to implement a remote file system client in Rust that presents a local mount point, mirroring the structure of the file system hosted on a remote server. The file system should support transparent read and write access to remote files.
 
 ## Goals
 
@@ -27,7 +26,7 @@ This project aims to implement a remote file system client in Rust that presents
 
 ### Server Interface and implementation
 
-The server should offer a set RESTful API for file operations:
+The server offers a RESTful API for file operations:
 
 - GET /list/`path` – List directory contents
 - GET /files/`path` – Read file contents
@@ -39,7 +38,11 @@ The server should offer a set RESTful API for file operations:
 - DELETE /directories/`path` – Delete empty directory
 - POST /rename – Rename or move a file/directory
 
-The server can be implemented using any language or framework, but should be RESTful and stateless.
+The server should be RESTful and stateless.
+
+The endpoint list here is only a quick overview. Headers, payloads, exact
+success/error codes, durability behavior, and compatibility rules are defined
+in [the protocol v1 document](docs/protocol-v1.md).
 
 ### Caching
 
@@ -50,7 +53,7 @@ The server can be implemented using any language or framework, but should be RES
 
 New Windows files are written to a durable local journal before WinFSP reports a successful write. A bounded background uploader then sends the complete file through the normal `PUT /files/path` endpoint using standard `If-None-Match: *` create-only semantics. The server streams the upload into a transaction file, flushes it to durable storage, and atomically commits it without overwriting a conflicting remote path.
 
-This is not a tiny-file-specific server API. It applies to newly created files of any size and has two separate timing boundaries:
+This applies to newly created files of any size and has two separate timing boundaries:
 
 - **Local completion:** the data has been flushed to the client journal and can be recovered after a client crash or restart.
 - **Server durability:** the server has flushed and atomically committed the file, after which the journal entry is removed.
@@ -218,6 +221,16 @@ python3 ./scripts/e2e_stress.py run \
 
 Use `--sparse-mib 1024` for a full 1 GiB sparse-file transfer test. Every run creates a unique isolated server directory and removes it after success. Add `--keep` to retain a successful run. Failed runs are retained for diagnosis unless `--cleanup-on-failure` is explicitly supplied.
 
+Large-file output separates mounted creation/local journal sync, remote
+visibility after the local close, API verification download, and mounted verification
+read, with effective MiB/s for each phase. The normal large-file case therefore
+moves the logical file over the network three times: one upload and two
+verification downloads. The sparse case uses one upload and one verification
+download; sparse extents are not encoded by the HTTP protocol, so a 1 GiB
+sparse file still transfers 1 GiB in each direction. Add
+`--skip-mounted-large-read` to omit the second large-file download while keeping
+the full server-side SHA-256 verification.
+
 #### Forced client-crash recovery test (Windows journal)
 
 This deliberately leaves journal entries pending, kills the client, and verifies that the next client process replays every byte. First mount the Windows client with uploads paused:
@@ -260,3 +273,121 @@ python .\scripts\e2e_stress.py verify-recovery `
 ```
 
 `REMOTE_FS_UPLOAD_PAUSED` exists only for this crash-recovery test; never enable it for normal use. The normal E2E suite is client/server platform-independent. The forced-crash phase currently targets the Windows write journal and should be extended to FUSE when the same write-behind mechanism is enabled there.
+
+## Project roadmap / TODO
+
+The primary goal is not to accumulate features. The filesystem should first
+become **fast, secure, reliable, cleanly implemented, well documented, and easy
+to use**. New user-facing features are secondary to those qualities.
+
+Keep performance work grounded in measurements: a filesystem operation is
+almost always I/O-bound, so its speed is normally limited by the storage device
+or network rather than CPU performance. Benchmarks should therefore report
+local disk/journal time, network upload and download throughput, server commit
+time, and protocol overhead separately before optimizing code.
+
+### 1. Make the filesystem genuinely remote
+
+- [ ] Test private remote access across different networks using an encrypted
+  overlay such as Tailscale/WireGuard. Do not require the client and server to
+  share a LAN, and do not require router port forwarding for this mode.
+- [ ] Keep the bearer token enabled as defense in depth and restrict network
+  access to explicitly authorized devices.
+- [ ] Test real remote file exchange with multiple devices.
+- [ ] Add a documented public deployment option using a domain, TLS, and a
+  reverse proxy such as Caddy. Keep the Rust server bound to loopback behind the
+  proxy; never expose the plaintext port directly to the public internet.
+- [ ] Document deployment when the server is behind NAT/CGNAT, has a changing IP
+  address, or is hosted on a VPS.
+
+### 2. Perform a production security review
+
+- [ ] Create a threat model covering untrusted clients, compromised tokens,
+  malicious filenames and request bodies, concurrent requests, and hostile
+  network conditions.
+- [ ] Audit every filesystem boundary for path traversal, symlink/reparse-point
+  escapes, unsafe temporary files, race conditions, permission mistakes, and
+  arbitrary file overwrite or deletion.
+- [ ] Specifically test for remote code execution, command/argument injection,
+  denial of service, memory/disk exhaustion, decompression bombs if compression
+  is added, and malformed protocol input.
+- [ ] Add request-size, concurrency, rate, storage-quota, and timeout limits that
+  fail safely without losing acknowledged data.
+- [ ] Add per-device credentials with rotation and revocation instead of relying
+  indefinitely on one shared bearer token. Store server-side secrets safely and
+  avoid logging credentials.
+- [ ] Add dependency auditing, static analysis, fuzzing, and adversarial API
+  integration tests to CI.
+- [ ] Perform a dedicated security review before declaring the application
+  production-ready. “No known vulnerability” must be supported by evidence and
+  testing rather than assumed.
+
+### 3. Make WAN transfers resumable and verifiable
+
+- [ ] Replace single-request large uploads with a generic resumable upload
+  transaction: create an upload ID, send offset-addressed chunks, query durable
+  progress after reconnecting, and atomically commit the final file.
+- [ ] Verify the expected size and a strong end-to-end checksum (for example
+  SHA-256) before publishing a completed upload.
+- [ ] Keep the local journal until the server confirms checksum verification and
+  durable commit. Retrying must never overwrite a conflicting remote version.
+- [ ] Make streaming timeouts configurable and use bounded retries with
+  exponential backoff and jitter for temporary network failures.
+- [ ] Resume interrupted downloads with range requests and verify their final
+  checksum when appropriate.
+- [ ] Represent sparse extents explicitly so sparse files do not transfer every
+  logical zero byte over the network.
+
+### 4. Strengthen multi-client correctness and durability
+
+- [ ] Add file versions/ETags and conditional mutations so two clients cannot
+  silently overwrite each other's changes.
+- [ ] Define conflict behavior, cache invalidation, rename semantics, and optional
+  file locking or leases for concurrent clients.
+- [ ] Extend durable write journaling and crash replay to modifications of
+  existing files and to FUSE clients, not only new Windows files.
+- [ ] Test simultaneous Windows, macOS, and Linux clients against every supported
+  server platform.
+- [ ] Add snapshots/version history and a documented backup/restore procedure.
+  Durability and `sync_all` do not replace independent backups.
+- [ ] Test disk-full, journal-full, corrupted-journal, server-crash, client-crash,
+  power-loss, and conflicting-recovery scenarios.
+
+### 5. Improve WAN performance with evidence
+
+- [ ] Benchmark high latency, packet loss, bandwidth limits, disconnects, and
+  relayed versus direct remote connections.
+- [ ] Measure metadata-heavy workloads separately from sequential large-file
+  throughput; optimize round trips, queueing, and concurrency only where the
+  measurements show a real bottleneck.
+- [ ] Evaluate request multiplexing, adaptive upload concurrency, compression,
+  deduplication, and metadata batching without weakening durability.
+- [ ] Keep bounded memory and disk usage under concurrent large transfers.
+- [ ] Define repeatable performance targets for LAN and WAN environments and
+  prevent regressions in CI where practical.
+
+### 6. Production operations and ease of use
+
+- [ ] Add configuration files and secret-loading options while retaining useful
+  environment-variable overrides.
+- [ ] Package the server as a `systemd`, `launchd`, or Windows service with
+  graceful shutdown and restart behavior.
+- [ ] Provide installers/packages that set up WinFSP/macFUSE prerequisites and
+  make mounting possible without a Rust development environment.
+- [ ] Add health/readiness endpoints, structured logs, useful metrics, disk-space
+  alerts, and an auditable history of destructive operations.
+- [ ] Improve error messages so authentication, connectivity, conflicts, disk
+  exhaustion, and recovery problems each have an immediate corrective action.
+- [ ] Maintain one short quick-start path for each supported client/server OS
+  combination, including remote deployment and complete removal/uninstallation.
+
+### Suggested implementation order
+
+1. Deploy and test private remote access with Tailscale/WireGuard.
+2. Complete the threat model and security hardening before public exposure.
+3. Implement resumable, checksum-verified uploads and downloads.
+4. Add multi-client conflict protection and cross-platform crash recovery.
+5. Add backups, operational packaging, observability, and public HTTPS
+   deployment.
+6. Consider optional features only after the quality, security, reliability,
+   performance, documentation, and usability targets are consistently met.

@@ -1,13 +1,18 @@
 use crate::api::{self, DirectoryEntry, RemoteMetadata};
+use crate::remote_path;
 use crate::writeback::{PendingFile, Writeback};
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::hash_map::DefaultHasher,
     ffi::{OsStr, c_void},
     hash::{Hash, Hasher},
     io::ErrorKind,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
+
+mod cache;
+mod ops;
+use cache::WindowsCache;
 use winfsp::{
     FspError, Result, U16CStr,
     constants::FspCleanupFlags,
@@ -27,10 +32,6 @@ const SECTOR_SIZE: u64 = 4096;
 const UNIX_EPOCH_AS_FILETIME_SECS: u64 = 11_644_473_600;
 const STATUS_UNEXPECTED_IO_ERROR: i32 = 0xC000_00E9u32 as i32;
 const ERROR_DIR_NOT_EMPTY: u32 = 145;
-const METADATA_CACHE_TTL: Duration = Duration::from_secs(1);
-const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
-const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(1);
-const DIRECTORY_CACHE_MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryKind {
@@ -46,18 +47,6 @@ struct RemoteEntry {
     mode: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
-struct CachedRemoteEntry {
-    entry: RemoteEntry,
-    cached_at: Instant,
-}
-
-#[derive(Clone, Debug)]
-struct CachedDirectoryEntries {
-    entries: Vec<DirectoryEntry>,
-    cached_at: Instant,
-}
-
 struct WinHandle {
     path: Mutex<String>,
     kind: EntryKind,
@@ -71,8 +60,7 @@ struct RemoteWinFs {
     server_addr: String,
     runtime: tokio::runtime::Runtime,
     writeback: Writeback,
-    metadata_cache: Mutex<HashMap<String, CachedRemoteEntry>>,
-    directory_cache: Mutex<HashMap<String, CachedDirectoryEntries>>,
+    cache: WindowsCache,
 }
 
 pub fn run(
@@ -87,8 +75,7 @@ pub fn run(
         server_addr: server_url.to_string(),
         runtime,
         writeback,
-        metadata_cache: Mutex::new(HashMap::new()),
-        directory_cache: Mutex::new(HashMap::new()),
+        cache: WindowsCache::new(),
     };
 
     let mut volume = VolumeParams::new();
@@ -194,83 +181,16 @@ impl RemoteWinFs {
         self.runtime.block_on(future)
     }
 
-    fn api_path(path: &str) -> &str {
-        path.trim_start_matches('/')
-    }
-
-    fn cached_metadata(&self, path: &str) -> Option<RemoteEntry> {
-        let mut cache = self.metadata_cache.lock().unwrap();
-        if let Some(cached) = cache.get(path)
-            && cached.cached_at.elapsed() <= METADATA_CACHE_TTL
-        {
-            return Some(cached.entry.clone());
-        }
-        cache.remove(path);
-        None
-    }
-
-    fn cached_parent_metadata(&self, path: &str) -> Option<Result<RemoteEntry>> {
-        if path == "/" {
-            return None;
-        }
-
-        let parent = parent_path(path);
-        let name = path.rsplit('/').next().unwrap_or_default();
-        let mut cache = self.directory_cache.lock().unwrap();
-        let cached = cache.get(&parent)?;
-        if cached.cached_at.elapsed() > DIRECTORY_CACHE_TTL {
-            cache.remove(&parent);
-            return None;
-        }
-
-        Some(
-            cached
-                .entries
-                .iter()
-                .find(|entry| entry.name == name)
-                .map(RemoteEntry::from_directory_entry)
-                .ok_or(FspError::IO(ErrorKind::NotFound)),
-        )
-    }
-
-    fn cache_metadata(&self, path: &str, entry: &RemoteEntry) {
-        let mut cache = self.metadata_cache.lock().unwrap();
-        if cache.len() >= METADATA_CACHE_MAX_ENTRIES {
-            cache.retain(|_, cached| cached.cached_at.elapsed() <= METADATA_CACHE_TTL);
-            if cache.len() >= METADATA_CACHE_MAX_ENTRIES {
-                cache.clear();
-            }
-        }
-        cache.insert(
-            path.to_string(),
-            CachedRemoteEntry {
-                entry: entry.clone(),
-                cached_at: Instant::now(),
-            },
-        );
-    }
-
-    fn invalidate_metadata_tree(&self, path: &str) {
-        let prefix = format!("{}/", path.trim_end_matches('/'));
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .retain(|cached_path, _| cached_path != path && !cached_path.starts_with(&prefix));
-    }
-
     fn list_directory_cached(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
-        {
-            let mut cache = self.directory_cache.lock().unwrap();
-            if let Some(cached) = cache.get(path)
-                && cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL
-            {
-                return Ok(cached.entries.clone());
-            }
-            cache.remove(path);
+        if let Some(entries) = self.cache.directory(path) {
+            return Ok(entries);
         }
 
         let mut entries = self
-            .block_on(api::list_directory(&self.server_addr, Self::api_path(path)))
+            .block_on(api::list_directory(
+                &self.server_addr,
+                remote_path::api(path),
+            ))
             .map_err(|error| fsp_error_from_api(&error))?;
         for pending in self.writeback.entries_in_directory(path) {
             if pending.is_committed() {
@@ -282,67 +202,8 @@ impl RemoteWinFs {
             entries.push(directory_entry_from_remote(name, &entry));
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut cache = self.directory_cache.lock().unwrap();
-        if cache.len() >= DIRECTORY_CACHE_MAX_ENTRIES {
-            cache.retain(|_, cached| cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL);
-            if cache.len() >= DIRECTORY_CACHE_MAX_ENTRIES {
-                cache.clear();
-            }
-        }
-        cache.insert(
-            path.to_string(),
-            CachedDirectoryEntries {
-                entries: entries.clone(),
-                cached_at: Instant::now(),
-            },
-        );
+        self.cache.insert_directory(path, entries.clone());
         Ok(entries)
-    }
-
-    fn update_directory_cache_for_path(&self, path: &str, entry: &RemoteEntry) {
-        if path == "/" {
-            return;
-        }
-        let parent = parent_path(path);
-        let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) else {
-            return;
-        };
-        let mut cache = self.directory_cache.lock().unwrap();
-        let Some(cached) = cache.get_mut(&parent) else {
-            return;
-        };
-        if cached.cached_at.elapsed() > DIRECTORY_CACHE_TTL {
-            cache.remove(&parent);
-            return;
-        }
-        cached.entries.retain(|item| item.name != name);
-        cached
-            .entries
-            .push(directory_entry_from_remote(name, entry));
-        cached
-            .entries
-            .sort_by(|left, right| left.name.cmp(&right.name));
-        cached.cached_at = Instant::now();
-    }
-
-    fn remove_from_directory_cache(&self, path: &str) {
-        if path == "/" {
-            self.directory_cache.lock().unwrap().clear();
-            return;
-        }
-        let parent = parent_path(path);
-        let name = path.rsplit('/').next().unwrap_or_default();
-        let prefix = format!("{}/", path.trim_end_matches('/'));
-        let mut cache = self.directory_cache.lock().unwrap();
-        cache.retain(|cached_path, _| cached_path != path && !cached_path.starts_with(&prefix));
-        if let Some(cached) = cache.get_mut(&parent) {
-            if cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL {
-                cached.entries.retain(|entry| entry.name != name);
-                cached.cached_at = Instant::now();
-            } else {
-                cache.remove(&parent);
-            }
-        }
     }
 
     fn metadata_for_path(&self, path: &str) -> Result<RemoteEntry> {
@@ -356,19 +217,19 @@ impl RemoteWinFs {
             return remote_entry_for_pending(&pending);
         }
 
-        if let Some(entry) = self.cached_metadata(path) {
+        if let Some(entry) = self.cache.metadata(path) {
             return Ok(entry);
         }
 
-        if let Some(entry) = self.cached_parent_metadata(path) {
+        if let Some(entry) = self.cache.parent_metadata(path) {
             return entry;
         }
 
         let metadata = self
-            .block_on(api::get_metadata(&self.server_addr, Self::api_path(path)))
+            .block_on(api::get_metadata(&self.server_addr, remote_path::api(path)))
             .map_err(|error| fsp_error_from_api(&error))?;
         let entry = RemoteEntry::from_metadata(&metadata);
-        self.cache_metadata(path, &entry);
+        self.cache.insert_metadata(path, &entry);
         Ok(entry)
     }
 
@@ -392,13 +253,13 @@ impl RemoteWinFs {
         let entry = RemoteEntry::from_metadata(&metadata);
         context.update_entry(entry.clone());
         let path = context.path();
-        self.cache_metadata(&path, &entry);
-        self.update_directory_cache_for_path(&path, &entry);
+        self.cache.insert_metadata(&path, &entry);
+        self.cache.update_directory_for_path(&path, &entry);
         Ok(Some(entry))
     }
 
     fn delete_path(&self, path: &str, kind: EntryKind) -> Result<()> {
-        let api_path = Self::api_path(path);
+        let api_path = remote_path::api(path);
         let result = match kind {
             EntryKind::File => self
                 .block_on(api::delete_file(&self.server_addr, api_path))
@@ -408,8 +269,8 @@ impl RemoteWinFs {
                 .map_err(|error| fsp_error_from_api(&error)),
         };
         if result.is_ok() {
-            self.invalidate_metadata_tree(path);
-            self.remove_from_directory_cache(path);
+            self.cache.invalidate_metadata_tree(path);
+            self.cache.remove_path(path);
         }
         result
     }
@@ -428,7 +289,10 @@ impl RemoteWinFs {
                     return Err(FspError::WIN32(ERROR_DIR_NOT_EMPTY));
                 }
                 let entries = self
-                    .block_on(api::list_directory(&self.server_addr, Self::api_path(path)))
+                    .block_on(api::list_directory(
+                        &self.server_addr,
+                        remote_path::api(path),
+                    ))
                     .map_err(|error| fsp_error_from_api(&error))?;
                 if !entries.is_empty() {
                     return Err(FspError::WIN32(ERROR_DIR_NOT_EMPTY));
@@ -436,453 +300,6 @@ impl RemoteWinFs {
             }
         }
 
-        Ok(())
-    }
-}
-
-impl FileSystemContext for RemoteWinFs {
-    type FileContext = WinHandle;
-
-    fn get_security_by_name(
-        &self,
-        file_name: &U16CStr,
-        _security_descriptor: Option<&mut [c_void]>,
-        _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
-    ) -> Result<FileSecurity> {
-        let path = normalize_winfsp_path(file_name);
-        let entry = self.metadata_for_path(&path)?;
-
-        Ok(FileSecurity {
-            reparse: false,
-            sz_security_descriptor: 0,
-            attributes: file_attributes(&entry),
-        })
-    }
-
-    fn open(
-        &self,
-        file_name: &U16CStr,
-        _create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
-        file_info: &mut OpenFileInfo,
-    ) -> Result<Self::FileContext> {
-        let path = normalize_winfsp_path(file_name);
-        let entry = self.fill_file_info_for_path(&path, file_info.as_mut())?;
-        let pending = self.writeback.get(&path);
-        Ok(WinHandle::new_with_pending(path, entry, pending))
-    }
-
-    fn close(&self, context: Self::FileContext) {
-        if let Some(pending) = &context.pending
-            && !pending.is_committed()
-            && !*context.delete_on_cleanup.lock().unwrap()
-            && let Err(error) = self.writeback.enqueue(pending)
-        {
-            log::error!(
-                "Could not queue {} for upload; its durable journal was retained: {error}",
-                pending.path()
-            );
-        }
-    }
-
-    fn create(
-        &self,
-        file_name: &U16CStr,
-        create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
-        _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
-        _security_descriptor: Option<&[c_void]>,
-        _allocation_size: u64,
-        extra_buffer: Option<&[u8]>,
-        _extra_buffer_is_reparse_point: bool,
-        file_info: &mut OpenFileInfo,
-    ) -> Result<Self::FileContext> {
-        let path = normalize_winfsp_path(file_name);
-        let api_path = Self::api_path(&path);
-        let is_directory = create_options & FILE_DIRECTORY_FILE != 0;
-        let (entry, pending) = if is_directory {
-            let metadata = self
-                .block_on(api::create_directory(&self.server_addr, api_path, 0o755))
-                .map_err(|error| fsp_error_from_api(&error))?;
-            (RemoteEntry::from_metadata(&metadata), None)
-        } else {
-            let pending = self
-                .writeback
-                .stage_new(&path, 0o644)
-                .map_err(fsp_error_from_io)?;
-            if let Some(bytes) = extra_buffer.filter(|bytes| !bytes.is_empty())
-                && let Err(error) = pending.write_at(bytes, 0)
-            {
-                let _ = self.writeback.discard(&pending);
-                return Err(fsp_error_from_io(error));
-            }
-            let entry = remote_entry_for_pending(&pending)?;
-            (entry, Some(pending))
-        };
-        self.cache_metadata(&path, &entry);
-        self.update_directory_cache_for_path(&path, &entry);
-        fill_file_info(file_info.as_mut(), &path, &entry);
-        Ok(WinHandle::new_with_pending(path, entry, pending))
-    }
-
-    fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
-        let delete = *context.delete_on_cleanup.lock().unwrap()
-            || FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
-        if delete {
-            let path = context.path();
-            let result = if let Some(pending) = &context.pending {
-                if pending.is_committed() {
-                    self.delete_path(&path, context.kind)
-                } else {
-                    self.writeback
-                        .discard(pending)
-                        .map_err(fsp_error_from_io)
-                        .or_else(|_| {
-                            self.materialize_pending(context)?;
-                            self.delete_path(&path, context.kind)
-                        })
-                }
-            } else {
-                self.delete_path(&path, context.kind)
-            };
-            if let Err(error) = result {
-                log::warn!("Failed to delete {path} during cleanup: {error:?}");
-            } else {
-                self.invalidate_metadata_tree(&path);
-                self.remove_from_directory_cache(&path);
-            }
-        }
-    }
-
-    fn flush(&self, context: Option<&Self::FileContext>, file_info: &mut FileInfo) -> Result<()> {
-        if let Some(context) = context {
-            if let Some(pending) = &context.pending
-                && !pending.is_committed()
-            {
-                self.writeback.enqueue(pending).map_err(fsp_error_from_io)?;
-            }
-            let path = context.path();
-            fill_file_info(file_info, &path, &context.entry());
-        } else {
-            self.writeback.flush_all().map_err(fsp_error_from_io)?;
-        }
-        Ok(())
-    }
-
-    fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
-        let path = context.path();
-        let entry = if let Some(pending) = &context.pending {
-            if let Some(metadata) = pending.committed_metadata() {
-                RemoteEntry::from_metadata(&metadata)
-            } else {
-                remote_entry_for_pending(pending)?
-            }
-        } else {
-            self.metadata_for_path(&path)?
-        };
-        context.update_entry(entry.clone());
-        fill_file_info(file_info, &path, &entry);
-        Ok(())
-    }
-
-    fn overwrite(
-        &self,
-        context: &Self::FileContext,
-        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
-        replace_file_attributes: bool,
-        _allocation_size: u64,
-        _extra_buffer: Option<&[u8]>,
-        file_info: &mut FileInfo,
-    ) -> Result<()> {
-        if context.kind != EntryKind::File {
-            return Err(FspError::IO(ErrorKind::IsADirectory));
-        }
-
-        self.materialize_pending(context)?;
-        let path = context.path();
-        let current = self.metadata_for_path(&path)?;
-        let mode = mode_after_overwrite(current.mode, file_attributes, replace_file_attributes);
-        let metadata = self
-            .block_on(api::overwrite_file(
-                &self.server_addr,
-                Self::api_path(&path),
-                mode,
-            ))
-            .map_err(|error| fsp_error_from_api(&error))?;
-        let entry = RemoteEntry::from_metadata(&metadata);
-        context.update_entry(entry.clone());
-        self.cache_metadata(&path, &entry);
-        self.update_directory_cache_for_path(&path, &entry);
-        fill_file_info(file_info, &path, &entry);
-        Ok(())
-    }
-
-    fn read_directory(
-        &self,
-        context: &Self::FileContext,
-        _pattern: Option<&U16CStr>,
-        marker: DirMarker,
-        buffer: &mut [u8],
-    ) -> Result<u32> {
-        if context.kind != EntryKind::Directory {
-            return Err(FspError::IO(ErrorKind::NotADirectory));
-        }
-
-        if marker.is_none() {
-            let path = context.path();
-            let entries = self.list_directory_cached(&path)?;
-            let lock = context
-                .dir_buffer
-                .acquire(true, Some(entries.len() as u32 + 2))?;
-
-            let current = context.entry();
-            write_dir_entry(&lock, ".", &path, &current)?;
-            let parent = parent_path(&path);
-            let parent_entry = self.metadata_for_path(&parent)?;
-            write_dir_entry(&lock, "..", &parent, &parent_entry)?;
-
-            for entry in entries {
-                let child_path = child_path(&path, &entry.name);
-                let remote_entry = RemoteEntry::from_directory_entry(&entry);
-                self.cache_metadata(&child_path, &remote_entry);
-                write_dir_entry(&lock, &entry.name, &child_path, &remote_entry)?;
-            }
-        }
-
-        Ok(context.dir_buffer.read(marker, buffer))
-    }
-
-    fn rename(
-        &self,
-        context: &Self::FileContext,
-        file_name: &U16CStr,
-        new_file_name: &U16CStr,
-        replace_if_exists: bool,
-    ) -> Result<()> {
-        let from = normalize_winfsp_path(file_name);
-        let to = normalize_winfsp_path(new_file_name);
-
-        self.materialize_pending(context)?;
-
-        self.block_on(api::rename_file(
-            &self.server_addr,
-            Self::api_path(&from),
-            Self::api_path(&to),
-            replace_if_exists,
-        ))
-        .map_err(|error| fsp_error_from_api(&error))?;
-
-        self.metadata_cache.lock().unwrap().clear();
-        self.directory_cache.lock().unwrap().clear();
-        *context.path.lock().unwrap() = to.clone();
-        self.cache_metadata(&to, &context.entry());
-        Ok(())
-    }
-
-    fn set_basic_info(
-        &self,
-        context: &Self::FileContext,
-        _file_attributes: u32,
-        _creation_time: u64,
-        _last_access_time: u64,
-        last_write_time: u64,
-        _last_change_time: u64,
-        file_info: &mut FileInfo,
-    ) -> Result<()> {
-        let path = context.path();
-        let mtime = system_time_from_filetime(last_write_time);
-        if mtime.is_some() {
-            self.materialize_pending(context)?;
-            let metadata = self
-                .block_on(api::update_metadata(
-                    &self.server_addr,
-                    Self::api_path(&path),
-                    None,
-                    None,
-                    None,
-                    mtime,
-                ))
-                .map_err(|error| fsp_error_from_api(&error))?;
-            let entry = RemoteEntry::from_metadata(&metadata);
-            context.update_entry(entry.clone());
-            self.cache_metadata(&path, &entry);
-            self.update_directory_cache_for_path(&path, &entry);
-            fill_file_info(file_info, &path, &entry);
-        } else {
-            fill_file_info(file_info, &path, &context.entry());
-        }
-        Ok(())
-    }
-
-    fn set_delete(
-        &self,
-        context: &Self::FileContext,
-        _file_name: &U16CStr,
-        delete_file: bool,
-    ) -> Result<()> {
-        if delete_file {
-            self.validate_delete(&context.path(), context.kind)?;
-        }
-        *context.delete_on_cleanup.lock().unwrap() = delete_file;
-        Ok(())
-    }
-
-    fn set_file_size(
-        &self,
-        context: &Self::FileContext,
-        new_size: u64,
-        set_allocation_size: bool,
-        file_info: &mut FileInfo,
-    ) -> Result<()> {
-        if set_allocation_size {
-            let path = context.path();
-            fill_file_info(file_info, &path, &context.entry());
-            return Ok(());
-        }
-
-        let path = context.path();
-        if let Some(pending) = &context.pending
-            && !pending.is_committed()
-        {
-            match pending.resize(new_size) {
-                Ok(()) => {
-                    let entry = remote_entry_for_pending(pending)?;
-                    context.update_entry(entry.clone());
-                    self.cache_metadata(&path, &entry);
-                    self.update_directory_cache_for_path(&path, &entry);
-                    fill_file_info(file_info, &path, &entry);
-                    return Ok(());
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::WouldBlock | ErrorKind::AlreadyExists
-                    ) =>
-                {
-                    self.materialize_pending(context)?;
-                }
-                Err(error) => return Err(fsp_error_from_io(error)),
-            }
-        }
-        let metadata = self
-            .block_on(api::resize_file(
-                &self.server_addr,
-                Self::api_path(&path),
-                new_size,
-            ))
-            .map_err(|error| fsp_error_from_api(&error))?;
-        let entry = RemoteEntry::from_metadata(&metadata);
-        context.update_entry(entry.clone());
-        self.cache_metadata(&path, &entry);
-        self.update_directory_cache_for_path(&path, &entry);
-        fill_file_info(file_info, &path, &entry);
-        Ok(())
-    }
-
-    fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
-        if context.kind != EntryKind::File {
-            return Err(FspError::IO(ErrorKind::IsADirectory));
-        }
-
-        if let Some(pending) = &context.pending
-            && !pending.is_committed()
-        {
-            match pending.read_at(buffer, offset) {
-                Ok(size) => return Ok(size as u32),
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::AlreadyExists) => {}
-                Err(error) => return Err(fsp_error_from_io(error)),
-            }
-        }
-
-        let path = context.path();
-        let bytes = self
-            .block_on(api::read_file(
-                &self.server_addr,
-                Self::api_path(&path),
-                offset,
-                buffer.len() as u32,
-            ))
-            .map_err(|error| fsp_error_from_api(&error))?;
-        let bytes_to_copy = bytes.len().min(buffer.len());
-        buffer[..bytes_to_copy].copy_from_slice(&bytes[..bytes_to_copy]);
-        Ok(bytes_to_copy as u32)
-    }
-
-    fn write(
-        &self,
-        context: &Self::FileContext,
-        buffer: &[u8],
-        offset: u64,
-        write_to_eof: bool,
-        _constrained_io: bool,
-        file_info: &mut FileInfo,
-    ) -> Result<u32> {
-        if context.kind != EntryKind::File {
-            return Err(FspError::IO(ErrorKind::IsADirectory));
-        }
-
-        let path = context.path();
-        if let Some(pending) = &context.pending
-            && !pending.is_committed()
-        {
-            let local_offset = if write_to_eof {
-                pending.metadata().map_err(fsp_error_from_io)?.size
-            } else {
-                offset
-            };
-            match pending.write_at(buffer, local_offset) {
-                Ok(()) => {
-                    let entry = remote_entry_for_pending(pending)?;
-                    context.update_entry(entry.clone());
-                    self.cache_metadata(&path, &entry);
-                    self.update_directory_cache_for_path(&path, &entry);
-                    fill_file_info(file_info, &path, &entry);
-                    return Ok(buffer.len() as u32);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::WouldBlock | ErrorKind::AlreadyExists
-                    ) =>
-                {
-                    self.materialize_pending(context)?;
-                }
-                Err(error) => return Err(fsp_error_from_io(error)),
-            }
-        }
-        let offset = if write_to_eof {
-            let metadata = self
-                .block_on(api::get_metadata(&self.server_addr, Self::api_path(&path)))
-                .map_err(|error| fsp_error_from_api(&error))?;
-            let entry = RemoteEntry::from_metadata(&metadata);
-            let size = entry.size;
-            context.update_entry(entry.clone());
-            self.cache_metadata(&path, &entry);
-            size
-        } else {
-            offset
-        };
-        let metadata = self
-            .block_on(api::write_file(
-                &self.server_addr,
-                Self::api_path(&path),
-                buffer,
-                offset,
-            ))
-            .map_err(|error| fsp_error_from_api(&error))?;
-        let entry = RemoteEntry::from_metadata(&metadata);
-        context.update_entry(entry.clone());
-        self.cache_metadata(&path, &entry);
-        self.update_directory_cache_for_path(&path, &entry);
-        fill_file_info(file_info, &path, &entry);
-        Ok(buffer.len() as u32)
-    }
-
-    fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<()> {
-        out_volume_info.total_size = 1 << 40;
-        out_volume_info.free_size = 1 << 39;
-        out_volume_info.set_volume_label("remoteFS");
         Ok(())
     }
 }
@@ -944,22 +361,6 @@ fn normalize_winfsp_path(file_name: &U16CStr) -> String {
     }
 }
 
-fn parent_path(path: &str) -> String {
-    let trimmed = path.trim_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => format!("/{parent}"),
-        _ => "/".to_string(),
-    }
-}
-
-fn child_path(parent: &str, name: &str) -> String {
-    if parent == "/" {
-        format!("/{name}")
-    } else {
-        format!("{}/{}", parent.trim_end_matches('/'), name)
-    }
-}
-
 fn directory_entry_from_remote(name: &str, entry: &RemoteEntry) -> DirectoryEntry {
     DirectoryEntry {
         name: name.to_string(),
@@ -971,6 +372,8 @@ fn directory_entry_from_remote(name: &str, entry: &RemoteEntry) -> DirectoryEntr
         size: entry.size,
         modified_at: entry.modified_at.clone(),
         mode: entry.mode,
+        uid: None,
+        gid: None,
     }
 }
 

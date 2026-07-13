@@ -166,6 +166,55 @@ def wait_remote_hash(
     raise TestFailure(f"remote verification timed out for {remote_path}: {last_problem}")
 
 
+def wait_remote_file(
+    api: ApiClient, remote_path: str, expected_size: int, deadline: float
+) -> dict:
+    """Wait until an atomically committed file is visible at its final size."""
+    last_problem = "not checked"
+    while time.monotonic() < deadline:
+        try:
+            metadata = api.metadata(remote_path)
+            if metadata.get("type") == "file" and metadata.get("size") == expected_size:
+                return metadata
+            last_problem = (
+                f"type/size {metadata.get('type')}/{metadata.get('size')} != "
+                f"file/{expected_size}"
+            )
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            last_problem = "HTTP 404"
+        except (TimeoutError, urllib.error.URLError) as error:
+            last_problem = str(error)
+        time.sleep(0.1)
+    raise TestFailure(
+        f"server commit timed out for {remote_path}: {last_problem}"
+    )
+
+
+def print_throughput(label: str, byte_count: int, elapsed: float) -> None:
+    if elapsed < 0.001:
+        print(f"{label}: <0.001s (rate not meaningful)", flush=True)
+        return
+    mebibytes = byte_count / (1024 * 1024)
+    rate = mebibytes / elapsed
+    print(f"{label}: {elapsed:.3f}s ({rate:.2f} MiB/s)", flush=True)
+
+
+def verify_remote_hash_once(
+    api: ApiClient, remote_path: str, expected_hash: str, expected_size: int
+) -> None:
+    started = time.monotonic()
+    actual_hash, actual_size = api.hash_file(remote_path)
+    elapsed = time.monotonic() - started
+    if (actual_hash, actual_size) != (expected_hash, expected_size):
+        raise TestFailure(
+            f"server verification failed for {remote_path}: "
+            f"{actual_hash}/{actual_size} != {expected_hash}/{expected_size}"
+        )
+    print_throughput("API verification download", expected_size, elapsed)
+
+
 def verify_many_remote(
     api: ApiClient,
     expected: Iterable[tuple[str, str, int]],
@@ -429,23 +478,65 @@ def test_concurrent_files(
 
 
 def test_large_file(
-    mount_root: Path, remote_root: str, api: ApiClient, size_mib: int, timeout: float
+    mount_root: Path,
+    remote_root: str,
+    api: ApiClient,
+    size_mib: int,
+    timeout: float,
+    skip_mounted_read: bool = False,
 ) -> None:
     if size_mib <= 0:
         print("skipped (use --large-mib to enable)")
         return
     path = mount_root / "large.bin"
+    if skip_mounted_read:
+        print(
+            "network passes: one upload + API verification download; "
+            "mounted verification read disabled",
+            flush=True,
+        )
+    else:
+        print(
+            "network passes: one upload + API verification download + "
+            "mounted verification read",
+            flush=True,
+        )
+    local_started = time.monotonic()
     expected_hash, expected_size = write_pattern_file(
         path, size_mib * 1024 * 1024, 60_001
     )
-    wait_remote_hash(
+    print_throughput(
+        "mounted creation + local journal fsync",
+        expected_size,
+        time.monotonic() - local_started,
+    )
+
+    commit_started = time.monotonic()
+    wait_remote_file(
         api,
         f"{remote_root}/large.bin",
-        expected_hash,
         expected_size,
         time.monotonic() + timeout,
     )
-    assert_mounted_hash(path, expected_hash, expected_size)
+    print_throughput(
+        "remote visibility after local close (effective upload + commit)",
+        expected_size,
+        time.monotonic() - commit_started,
+    )
+
+    verify_remote_hash_once(
+        api, f"{remote_root}/large.bin", expected_hash, expected_size
+    )
+    if skip_mounted_read:
+        print("mounted verification read: skipped by request", flush=True)
+    else:
+        mounted_read_started = time.monotonic()
+        assert_mounted_hash(path, expected_hash, expected_size)
+        print_throughput(
+            "mounted verification read",
+            expected_size,
+            time.monotonic() - mounted_read_started,
+        )
 
 
 def test_sparse_file(
@@ -456,11 +547,12 @@ def test_sparse_file(
         return
     path = mount_root / "sparse.bin"
     size = size_mib * 1024 * 1024
-    with path.open("wb") as output:
-        output.seek(size - 1)
-        output.write(b"Z")
-        output.flush()
-        os.fsync(output.fileno())
+    print(
+        "network passes: one full logical upload + API verification download; "
+        "sparse extents are not encoded by the protocol",
+        flush=True,
+    )
+    expected_started = time.monotonic()
     expected = hashlib.sha256()
     zero_chunk = bytes(CHUNK_SIZE)
     remaining = size - 1
@@ -469,12 +561,42 @@ def test_sparse_file(
         expected.update(chunk)
         remaining -= len(chunk)
     expected.update(b"Z")
-    wait_remote_hash(
+    expected_hash = expected.hexdigest()
+    print(
+        f"local expected-hash preparation: "
+        f"{time.monotonic() - expected_started:.3f}s",
+        flush=True,
+    )
+
+    local_started = time.monotonic()
+    with path.open("wb") as output:
+        output.seek(size - 1)
+        output.write(b"Z")
+        output.flush()
+        os.fsync(output.fileno())
+    print_throughput(
+        "mounted sparse creation + local journal fsync",
+        size,
+        time.monotonic() - local_started,
+    )
+
+    commit_started = time.monotonic()
+    wait_remote_file(
         api,
         f"{remote_root}/sparse.bin",
-        expected.hexdigest(),
         size,
         time.monotonic() + timeout,
+    )
+    print_throughput(
+        "remote visibility after local close (effective upload + commit)",
+        size,
+        time.monotonic() - commit_started,
+    )
+    verify_remote_hash_once(api, f"{remote_root}/sparse.bin", expected_hash, size)
+    print(
+        "mounted verification read: skipped for sparse case to avoid a third "
+        "full logical transfer",
+        flush=True,
     )
 
 
@@ -529,6 +651,7 @@ def run_suite(args: argparse.Namespace) -> int:
                 api,
                 args.large_mib,
                 max(args.durability_timeout, args.large_mib * 4.0),
+                args.skip_mounted_large_read,
             )
         with section(f"sparse file ({args.sparse_mib} MiB logical)"):
             test_sparse_file(
@@ -642,6 +765,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--concurrent-count", type=int, default=64)
     run.add_argument("--large-mib", type=int, default=256)
     run.add_argument("--sparse-mib", type=int, default=0)
+    run.add_argument(
+        "--skip-mounted-large-read",
+        action="store_true",
+        help="Skip the second full large-file download through the mount",
+    )
     run.add_argument(
         "--cleanup-on-failure",
         action="store_true",

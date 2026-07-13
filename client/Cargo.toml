@@ -7,6 +7,7 @@ edition = "2024"
 serde = { version = "1.0", features = ["derive"] } # JSON serialization/deserialization for the API
 env_logger = "0.11" # Logging during development
 log = "0.4"
+remote-fs-protocol = { path = "../protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] } # HTTP calls and JSON handling
 
 tokio = { version = "1.0", features = ["full"] }

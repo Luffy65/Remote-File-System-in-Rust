@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+pub use remote_fs_protocol::{DirectoryEntry, RemoteMetadata};
+use remote_fs_protocol::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RenameRequest, headers};
+use reqwest::header::{HeaderMap, HeaderValue};
 use std::{
     fmt::Write,
     sync::OnceLock,
@@ -60,39 +62,18 @@ impl From<reqwest::Error> for UploadError {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct DirectoryEntry {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub size: u64,
-    pub modified_at: String,
-    pub mode: Option<u32>,
-    #[cfg(not(windows))]
-    pub uid: Option<u32>,
-    #[cfg(not(windows))]
-    pub gid: Option<u32>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct RemoteMetadata {
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub size: u64,
-    pub modified_at: String,
-    pub mode: Option<u32>,
-    #[cfg(not(windows))]
-    pub uid: Option<u32>,
-    #[cfg(not(windows))]
-    pub gid: Option<u32>,
-}
-
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static(PROTOCOL_VERSION),
+        );
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .default_headers(default_headers)
             .build()
             .expect("failed to build HTTP client")
     })
@@ -149,17 +130,17 @@ fn add_optional_metadata_headers(
     modified_at: Option<SystemTime>,
 ) -> reqwest::RequestBuilder {
     if let Some(mode) = mode {
-        request = request.header("X-File-Mode", format!("{:o}", mode & 0o7777));
+        request = request.header(headers::FILE_MODE, format!("{:o}", mode & 0o7777));
     }
     if let Some(uid) = uid {
-        request = request.header("X-File-Uid", uid.to_string());
+        request = request.header(headers::FILE_UID, uid.to_string());
     }
     if let Some(gid) = gid {
-        request = request.header("X-File-Gid", gid.to_string());
+        request = request.header(headers::FILE_GID, gid.to_string());
     }
     if let Some(modified_at) = modified_at {
         request = request.header(
-            "X-File-Mtime",
+            headers::FILE_MTIME,
             unix_seconds_from_system_time(modified_at).to_string(),
         );
     }
@@ -218,8 +199,8 @@ pub async fn read_file(
 
     let client = http_client();
     let response = authenticated(client.get(&request_url))
-        .header("X-File-Offset", offset.to_string())
-        .header("X-File-Size", size.to_string())
+        .header(headers::FILE_OFFSET, offset.to_string())
+        .header(headers::FILE_SIZE, size.to_string())
         .send()
         .await?
         .error_for_status()?;
@@ -263,7 +244,7 @@ pub async fn create_file(
 
     let client = http_client();
     let request = authenticated(client.put(&request_url))
-        .header("X-File-Offset", "0")
+        .header(headers::FILE_OFFSET, "0")
         .body(vec![]);
     let response = add_optional_metadata_headers(request, Some(mode), None, None, None)
         .send()
@@ -344,7 +325,7 @@ pub async fn write_file(
 
     let client = http_client();
     let response = authenticated(client.put(&request_url))
-        .header("X-File-Offset", offset.to_string())
+        .header(headers::FILE_OFFSET, offset.to_string())
         .body(data.to_vec())
         .send()
         .await?;
@@ -364,7 +345,7 @@ pub async fn resize_file(
 
     let client = http_client();
     let response = authenticated(client.put(&request_url))
-        .header("X-File-Truncate", size.to_string())
+        .header(headers::FILE_TRUNCATE, size.to_string())
         .body(vec![])
         .send()
         .await?;
@@ -383,7 +364,7 @@ pub async fn overwrite_file(
 
     let client = http_client();
     let request = authenticated(client.put(&request_url))
-        .header("X-File-Truncate", "0")
+        .header(headers::FILE_TRUNCATE, "0")
         .body(Vec::new());
     let response = add_optional_metadata_headers(request, mode, None, None, None)
         .send()
@@ -442,13 +423,6 @@ pub async fn delete_directory(base_url: &str, path: &str) -> Result<(), reqwest:
     Ok(())
 }
 
-#[derive(Serialize)]
-struct RenameRequest<'a> {
-    from: &'a str,
-    to: &'a str,
-    replace_if_exists: bool,
-}
-
 pub async fn rename_file(
     base_url: &str,
     from: &str,
@@ -470,8 +444,8 @@ pub async fn rename_file(
     let client = http_client();
     let response = authenticated(client.post(&request_url))
         .json(&RenameRequest {
-            from: normalized_from,
-            to: normalized_to,
+            from: normalized_from.to_string(),
+            to: normalized_to.to_string(),
             replace_if_exists,
         })
         .send()

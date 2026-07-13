@@ -3,4 +3,5 @@ resolver = "3"
 members = [
     "server",
     "client",
+    "protocol",
 ]

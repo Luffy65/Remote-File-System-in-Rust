@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api;
-use crate::cache::TtlLruCache;
+use crate::{cache::TtlLruCache, remote_path};
 
 // Keep the long fuser::Filesystem callback implementation separate from
 // the state/cache helpers in this file.
@@ -247,20 +247,7 @@ impl RemoteFs {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
         let parent_path = self.path_for_inode(parent).ok_or(ENOENT)?;
 
-        if parent_path == "/" {
-            Ok(format!("/{}", name_str))
-        } else {
-            Ok(format!(
-                "{}/{}",
-                parent_path.trim_end_matches('/'),
-                name_str
-            ))
-        }
-    }
-
-    fn parent_path(path: &str) -> String {
-        let parent = Path::new(path).parent().unwrap_or_else(|| Path::new("/"));
-        parent.to_str().unwrap_or("/").to_string()
+        Ok(remote_path::child(&parent_path, name_str))
     }
 
     fn directory_cache_key(path: &str) -> String {
@@ -268,14 +255,6 @@ impl RemoteFs {
             "/".to_string()
         } else {
             format!("/{}", path.trim_matches('/'))
-        }
-    }
-
-    fn api_path(path: &str) -> String {
-        if path == "/" {
-            "".to_string()
-        } else {
-            path.trim_start_matches('/').to_string()
         }
     }
 
@@ -380,10 +359,10 @@ impl RemoteFs {
         }
 
         debug!("DIRECTORY CACHE MISS: {}", cache_key);
-        let api_path = Self::api_path(&cache_key);
+        let api_path = remote_path::api(&cache_key);
         let entries = self
             .runtime
-            .block_on(api::list_directory(&self.server_addr, &api_path))?;
+            .block_on(api::list_directory(&self.server_addr, api_path))?;
 
         self.directory_cache
             .lock()
@@ -397,7 +376,7 @@ impl RemoteFs {
         let directory_path = if path == "/" {
             "/".to_string()
         } else {
-            Self::parent_path(path)
+            remote_path::parent(path).to_string()
         };
         let directory_key = Self::directory_cache_key(&directory_path);
 
@@ -406,7 +385,7 @@ impl RemoteFs {
 
     fn invalidate_directory_cache_tree(&self, path: &str) {
         let path_key = Self::directory_cache_key(path);
-        let parent_key = Self::directory_cache_key(&Self::parent_path(path));
+        let parent_key = Self::directory_cache_key(remote_path::parent(path));
         self.directory_cache.lock().unwrap().remove_matching(|key| {
             key == &path_key
                 || key == &parent_key
@@ -430,13 +409,13 @@ impl RemoteFs {
             return self.attr_for_inode(FUSE_ROOT_ID);
         }
 
-        let parent_path = Self::parent_path(path);
+        let parent_path = remote_path::parent(path);
         let name = Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
             .map(|name| name.to_string())?;
 
-        match self.list_directory_cached(&parent_path) {
+        match self.list_directory_cached(parent_path) {
             Ok(entries) => entries
                 .into_iter()
                 .find(|entry| entry.name == name)
