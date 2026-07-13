@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Cross-platform end-to-end stress and recovery tests for remote-fs.
 
-The normal suite can run with any supported client/server OS pairing.  The
-prepare-recovery/verify-recovery phases currently target the Windows durable
-write journal and deliberately require two separate client processes.
+The normal and recovery suites can run with any supported client/server OS
+pairing. The prepare-recovery/verify-recovery phases deliberately require two
+separate client processes.
 """
 
 from __future__ import annotations

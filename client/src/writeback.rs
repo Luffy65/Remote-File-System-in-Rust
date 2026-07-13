@@ -1,4 +1,4 @@
-//! Windows write-behind coordinator.
+//! Cross-platform write-behind coordinator for newly created files.
 //!
 //! The scheduler owns upload concurrency and conflict handling. Durable bytes,
 //! generations, and crash recovery live in `journal` so neither layer needs to
@@ -63,6 +63,8 @@ impl Writeback {
             .read(true)
             .write(true)
             .open(lock_path)?;
+
+        lock_file.try_lock()?;
 
         let mut entries = HashMap::new();
         for directory in fs::read_dir(&root)? {
@@ -269,11 +271,41 @@ impl Writeback {
 fn journal_root(server_addr: &str) -> PathBuf {
     let base = std::env::var_os("REMOTE_FS_JOURNAL_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .or_else(default_journal_base)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     base.join("remote-fs")
         .join("journal")
         .join(format!("server-{:016x}", stable_hash(server_addr)))
+}
+
+fn default_journal_base() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".local").join("state"))
+            })
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        None
+    }
 }
 
 fn stable_hash(value: &str) -> u64 {

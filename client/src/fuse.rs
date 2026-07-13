@@ -3,12 +3,17 @@ use libc::{ENOENT, c_int};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api;
-use crate::{cache::TtlLruCache, ownership, remote_path};
+use crate::{
+    cache::TtlLruCache,
+    ownership, remote_path,
+    writeback::{PendingFile, Writeback},
+};
 
 // Keep the long fuser::Filesystem callback implementation separate from
 // the state/cache helpers in this file.
@@ -112,6 +117,37 @@ fn attr_from_remote_metadata(ino: u64, metadata: &api::RemoteMetadata) -> FileAt
     )
 }
 
+fn attr_from_pending(ino: u64, pending: &PendingFile) -> io::Result<FileAttr> {
+    let metadata = pending.metadata()?;
+    Ok(create_file_attr(
+        ino,
+        FileType::RegularFile,
+        metadata.size,
+        (metadata.mode & 0o7777) as u16,
+        unsafe { libc::getuid() as u32 },
+        unsafe { libc::getgid() as u32 },
+        system_time_from_unix_seconds(&metadata.modified_at),
+    ))
+}
+
+fn directory_entry_from_pending(pending: &PendingFile) -> io::Result<api::DirectoryEntry> {
+    let metadata = pending.metadata()?;
+    Ok(api::DirectoryEntry {
+        name: pending
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        type_: "file".to_string(),
+        size: metadata.size,
+        modified_at: metadata.modified_at,
+        mode: Some(metadata.mode),
+        uid: None,
+        gid: None,
+    })
+}
+
 fn apply_umask(mode: u32, umask: u32, fallback: u16) -> u32 {
     let effective_mode = (mode & !umask) & 0o7777;
     if effective_mode == 0 {
@@ -142,6 +178,17 @@ fn errno_from_rmdir_error(error: &reqwest::Error) -> c_int {
     match error.status().map(|status| status.as_u16()) {
         Some(409) => libc::ENOTEMPTY,
         _ => errno_from_api_error(error),
+    }
+}
+
+fn errno_from_io_error(error: &io::Error) -> c_int {
+    match error.kind() {
+        io::ErrorKind::NotFound => ENOENT,
+        io::ErrorKind::AlreadyExists => libc::EEXIST,
+        io::ErrorKind::PermissionDenied => libc::EACCES,
+        io::ErrorKind::WouldBlock => libc::EBUSY,
+        io::ErrorKind::StorageFull => libc::ENOSPC,
+        _ => libc::EIO,
     }
 }
 
@@ -180,7 +227,6 @@ struct OpenHandle {
 
 // Client-side state that gives stateless HTTP paths stable FUSE inodes,
 // open file handles, and short-lived directory/attribute caches.
-#[derive(Debug)]
 pub struct RemoteFs {
     server_addr: String,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -190,11 +236,14 @@ pub struct RemoteFs {
     directory_cache: Arc<Mutex<TtlLruCache<String, Vec<api::DirectoryEntry>>>>,
     open_handles: Arc<Mutex<HashMap<u64, OpenHandle>>>,
     next_handle: Arc<Mutex<u64>>,
+    writeback: Writeback,
 }
 
 impl RemoteFs {
-    pub fn new(server_addr: &str) -> Self {
+    pub fn new(server_addr: &str) -> io::Result<Self> {
         let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let writeback = Writeback::new(server_addr, rt.handle().clone())?;
+        writeback.start_recovery();
         let mut inode_map_val = HashMap::new();
         let mut path_to_inode_val = HashMap::new();
 
@@ -219,7 +268,7 @@ impl RemoteFs {
             FUSE_ROOT_ID
         );
 
-        RemoteFs {
+        Ok(RemoteFs {
             server_addr: server_addr.to_string(),
             runtime: rt,
             inode_map: Arc::new(Mutex::new(inode_map_val)),
@@ -231,7 +280,8 @@ impl RemoteFs {
             ))),
             open_handles: Arc::new(Mutex::new(HashMap::new())),
             next_handle: Arc::new(Mutex::new(1)),
-        }
+            writeback,
+        })
     }
 
     // Finds the cached path that belongs to an inode.
@@ -318,6 +368,24 @@ impl RemoteFs {
         }
     }
 
+    fn has_open_file_handle(&self, path: &str) -> bool {
+        self.open_handles
+            .lock()
+            .unwrap()
+            .values()
+            .any(|handle| handle.kind == HandleKind::File && handle.path == path)
+    }
+
+    fn materialize_pending(&self, path: &str) -> io::Result<Option<api::RemoteMetadata>> {
+        let Some(pending) = self.writeback.get(path) else {
+            return Ok(None);
+        };
+        if let Some(metadata) = pending.committed_metadata() {
+            return Ok(Some(metadata));
+        }
+        self.writeback.flush(&pending).map(Some)
+    }
+
     fn cache_attr(&self, path: String, attr: FileAttr) {
         self.inode_map
             .lock()
@@ -353,7 +421,7 @@ impl RemoteFs {
     fn list_directory_cached(
         &self,
         directory_path: &str,
-    ) -> Result<Vec<api::DirectoryEntry>, reqwest::Error> {
+    ) -> Result<Vec<api::DirectoryEntry>, c_int> {
         // Directory listings are cached briefly because kernels can call
         // lookup/getattr/readdir in tight bursts for the same parent.
         let cache_key = Self::directory_cache_key(directory_path);
@@ -364,9 +432,21 @@ impl RemoteFs {
 
         debug!("DIRECTORY CACHE MISS: {}", cache_key);
         let api_path = remote_path::api(&cache_key);
-        let entries = self
+        let mut entries = self
             .runtime
-            .block_on(api::list_directory(&self.server_addr, api_path))?;
+            .block_on(api::list_directory(&self.server_addr, api_path))
+            .map_err(|error| errno_from_api_error(&error))?;
+
+        for pending in self.writeback.entries_in_directory(&cache_key) {
+            if pending.is_committed() {
+                continue;
+            }
+            let pending_entry = directory_entry_from_pending(&pending)
+                .map_err(|error| errno_from_io_error(&error))?;
+            entries.retain(|entry| entry.name != pending_entry.name);
+            entries.push(pending_entry);
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
 
         self.directory_cache
             .lock()

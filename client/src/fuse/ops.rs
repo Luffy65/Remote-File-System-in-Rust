@@ -1,6 +1,7 @@
 use super::{
-    HandleKind, RemoteFs, TRANSFER_IO_SIZE, TTL, api, apply_umask, attr_from_remote_metadata,
-    errno_from_api_error, errno_from_rmdir_error, time_or_now,
+    HandleKind, RemoteFs, TRANSFER_IO_SIZE, TTL, api, apply_umask, attr_from_pending,
+    attr_from_remote_metadata, errno_from_api_error, errno_from_io_error, errno_from_rmdir_error,
+    time_or_now,
 };
 use fuser::{
     FUSE_ROOT_ID, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -180,6 +181,16 @@ impl Filesystem for RemoteFs {
                     "Released file handle {} for path='{}', dirty={}",
                     fh, handle.path, handle.dirty
                 );
+                if !self.has_open_file_handle(&handle.path)
+                    && let Some(pending) = self.writeback.get(&handle.path)
+                    && !pending.is_committed()
+                    && let Err(error) = self.writeback.enqueue(&pending)
+                {
+                    error!(
+                        "Could not queue {} for upload; its durable journal was retained: {error}",
+                        pending.path()
+                    );
+                }
                 reply.ok();
             }
             Ok(handle) => {
@@ -291,7 +302,7 @@ impl Filesystem for RemoteFs {
             }
             Err(err) => {
                 error!("Failed to lookup {} on server: {:?}", full_path, err);
-                reply.error(errno_from_api_error(&err));
+                reply.error(err);
             }
         }
     }
@@ -345,32 +356,33 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
-        let api_path = full_path.trim_start_matches('/');
         let effective_mode = apply_umask(mode, _umask, 0o644);
 
-        // Tell the remote server to initialize the empty file and return real metadata.
-        match self.runtime.block_on(api::create_file(
-            &self.server_addr,
-            api_path,
-            effective_mode,
-        )) {
-            Ok(metadata) => {
-                let new_ino = self.allocate_inode();
-                let attr = attr_from_remote_metadata(new_ino, &metadata);
-                self.cache_attr(full_path.clone(), attr);
-                self.invalidate_directory_cache_for_path(&full_path);
-                let fh = self.allocate_handle(new_ino, full_path.clone(), HandleKind::File, _flags);
+        // Acknowledge only after an empty durable local journal entry exists.
+        match self.writeback.stage_new(&full_path, effective_mode) {
+            Ok(pending) => match attr_from_pending(self.allocate_inode(), &pending) {
+                Ok(attr) => {
+                    self.cache_attr(full_path.clone(), attr);
+                    self.invalidate_directory_cache_for_path(&full_path);
+                    let fh =
+                        self.allocate_handle(attr.ino, full_path.clone(), HandleKind::File, _flags);
 
-                debug!(
-                    "Successfully created file: ino={}, path='{}'",
-                    new_ino, full_path
-                );
+                    debug!(
+                        "Successfully created file: ino={}, path='{}'",
+                        attr.ino, full_path
+                    );
 
-                reply.created(&TTL, &attr, 0, fh, 0);
-            }
-            Err(err) => {
-                error!("Failed to create file {} on server: {:?}", api_path, err);
-                reply.error(errno_from_api_error(&err));
+                    reply.created(&TTL, &attr, 0, fh, 0);
+                }
+                Err(error) => {
+                    let _ = self.writeback.discard(&pending);
+                    error!("Failed to read new-file journal metadata: {error}");
+                    reply.error(errno_from_io_error(&error));
+                }
+            },
+            Err(error) => {
+                error!("Failed to create durable journal for {full_path}: {error}");
+                reply.error(errno_from_io_error(&error));
             }
         }
     }
@@ -414,7 +426,44 @@ impl Filesystem for RemoteFs {
         };
         let api_path = file_path.trim_start_matches('/');
 
-        // Send the chunk of bytes to the server.
+        if let Some(pending) = self.writeback.get(&file_path)
+            && !pending.is_committed()
+        {
+            match pending.write_at(data, offset as u64) {
+                Ok(()) => match attr_from_pending(ino, &pending) {
+                    Ok(attr) => {
+                        self.update_cached_attr(ino, attr);
+                        self.invalidate_directory_cache_for_path(&file_path);
+                        if _fh != 0 {
+                            self.mark_handle_dirty(_fh);
+                        }
+                        reply.written(data.len() as u32);
+                        return;
+                    }
+                    Err(error) => {
+                        reply.error(errno_from_io_error(&error));
+                        return;
+                    }
+                },
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    if let Err(error) = self.materialize_pending(&file_path) {
+                        reply.error(errno_from_io_error(&error));
+                        return;
+                    }
+                }
+                Err(error) => {
+                    reply.error(errno_from_io_error(&error));
+                    return;
+                }
+            }
+        }
+
+        // Existing files retain the synchronous server write path.
         match self.runtime.block_on(api::write_file(
             &self.server_addr,
             api_path,
@@ -467,24 +516,62 @@ impl Filesystem for RemoteFs {
         };
         let api_path = path.trim_start_matches('/');
         let mut latest_metadata = None;
+        let mut pending_changed = false;
 
-        // If the OS resizes a file, mirror that size change on the server.
+        // Resize a new file in its durable journal; existing files remain synchronous.
         if let Some(s) = size {
-            match self
-                .runtime
-                .block_on(api::resize_file(&self.server_addr, api_path, s))
+            let mut resize_remotely = true;
+            if let Some(pending) = self.writeback.get(&path)
+                && !pending.is_committed()
             {
-                Ok(metadata) => latest_metadata = Some(metadata),
-                Err(err) => {
-                    error!("Failed to resize file {} on server: {:?}", api_path, err);
-                    reply.error(errno_from_api_error(&err));
-                    return;
+                match pending.resize(s) {
+                    Ok(()) => {
+                        pending_changed = true;
+                        resize_remotely = false;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists
+                        ) =>
+                    {
+                        if let Err(error) = self.materialize_pending(&path) {
+                            reply.error(errno_from_io_error(&error));
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        reply.error(errno_from_io_error(&error));
+                        return;
+                    }
+                }
+            }
+            if resize_remotely {
+                match self
+                    .runtime
+                    .block_on(api::resize_file(&self.server_addr, api_path, s))
+                {
+                    Ok(metadata) => latest_metadata = Some(metadata),
+                    Err(err) => {
+                        error!("Failed to resize file {} on server: {:?}", api_path, err);
+                        reply.error(errno_from_api_error(&err));
+                        return;
+                    }
                 }
             }
         }
 
         let requested_mtime = _mtime.map(time_or_now);
         if mode.is_some() || uid.is_some() || gid.is_some() || requested_mtime.is_some() {
+            if self
+                .writeback
+                .get(&path)
+                .is_some_and(|pending| !pending.is_committed())
+                && let Err(error) = self.materialize_pending(&path)
+            {
+                reply.error(errno_from_io_error(&error));
+                return;
+            }
             match self.runtime.block_on(api::update_metadata(
                 &self.server_addr,
                 api_path,
@@ -507,6 +594,19 @@ impl Filesystem for RemoteFs {
             self.update_cached_attr(ino, attr);
             self.invalidate_directory_cache_for_path(&path);
             reply.attr(&TTL, &attr);
+        } else if pending_changed {
+            let Some(pending) = self.writeback.get(&path) else {
+                reply.error(libc::EIO);
+                return;
+            };
+            match attr_from_pending(ino, &pending) {
+                Ok(attr) => {
+                    self.update_cached_attr(ino, attr);
+                    self.invalidate_directory_cache_for_path(&path);
+                    reply.attr(&TTL, &attr);
+                }
+                Err(error) => reply.error(errno_from_io_error(&error)),
+            }
         } else if let Some(attr) = self.attr_for_inode(ino) {
             reply.attr(&TTL, &attr);
         } else {
@@ -552,6 +652,28 @@ impl Filesystem for RemoteFs {
         };
         let api_path = file_path.trim_start_matches('/');
 
+        if let Some(pending) = self.writeback.get(&file_path)
+            && !pending.is_committed()
+        {
+            let mut bytes = vec![0_u8; size as usize];
+            match pending.read_at(&mut bytes, offset as u64) {
+                Ok(read) => {
+                    bytes.truncate(read);
+                    reply.data(&bytes);
+                    return;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+                    ) => {}
+                Err(error) => {
+                    reply.error(errno_from_io_error(&error));
+                    return;
+                }
+            }
+        }
+
         // Fetch only the byte range requested by the kernel.
         match self.runtime.block_on(api::read_file(
             &self.server_addr,
@@ -590,6 +712,28 @@ impl Filesystem for RemoteFs {
             return;
         }
 
+        if let Some(pending) = self.writeback.get(&full_path)
+            && !pending.is_committed()
+        {
+            match self.writeback.discard(&pending) {
+                Ok(()) => {
+                    self.remove_cached_path(&full_path);
+                    reply.ok();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Err(error) = self.materialize_pending(&full_path) {
+                        reply.error(errno_from_io_error(&error));
+                        return;
+                    }
+                }
+                Err(error) => {
+                    reply.error(errno_from_io_error(&error));
+                    return;
+                }
+            }
+        }
+
         let api_path = full_path.trim_start_matches('/');
         match self
             .runtime
@@ -624,6 +768,10 @@ impl Filesystem for RemoteFs {
             && attr.attr.kind != FileType::Directory
         {
             reply.error(libc::ENOTDIR);
+            return;
+        }
+        if !self.writeback.entries_in_directory(&full_path).is_empty() {
+            reply.error(libc::ENOTEMPTY);
             return;
         }
 
@@ -682,6 +830,16 @@ impl Filesystem for RemoteFs {
             "rename(parent={}, raw_name={:?}, resolved_name='{}', newparent={}, raw_newname={:?}, resolved_newname='{}', flags={})",
             parent, name, from_path, newparent, newname, to_path, flags
         );
+
+        if self
+            .writeback
+            .get(&from_path)
+            .is_some_and(|pending| !pending.is_committed())
+            && let Err(error) = self.materialize_pending(&from_path)
+        {
+            reply.error(errno_from_io_error(&error));
+            return;
+        }
 
         let api_from = from_path.trim_start_matches('/');
         let api_to = to_path.trim_start_matches('/');
@@ -789,7 +947,7 @@ impl Filesystem for RemoteFs {
                         "Failed to list directory {} from server: {:?}",
                         current_path, err
                     );
-                    reply.error(errno_from_api_error(&err));
+                    reply.error(err);
                     return;
                 }
             }

@@ -57,8 +57,8 @@ mutations update or invalidate the affected entries.
 
 ### Synchronous write
 
-FUSE writes and modifications of existing Windows files currently use the
-synchronous path:
+Modifications of files that already exist on the server currently use the
+synchronous path on both platform adapters:
 
 ```mermaid
 sequenceDiagram
@@ -76,20 +76,20 @@ sequenceDiagram
     OS-->>App: completion or failure
 ```
 
-### Durable Windows new-file commit and recovery
+### Durable cross-platform new-file commit and recovery
 
 ```mermaid
 sequenceDiagram
     participant App as Local application
-    participant Win as WinFSP adapter
+    participant Adapter as WinFSP / FUSE adapter
     participant Journal as Local journal
     participant Upload as Writeback scheduler
     participant Server as Server transaction
     participant Disk as Server storage
-    App->>Win: create and write new file
-    Win->>Journal: persist bytes and journal metadata
+    App->>Adapter: create and write new file
+    Adapter->>Journal: persist bytes and journal metadata
     Journal-->>App: local completion after sync
-    Win->>Upload: enqueue bounded upload
+    Adapter->>Upload: enqueue bounded upload
     Upload->>Server: PUT + If-None-Match: *
     Server->>Disk: stream temp file, sync, hard-link commit, sync directory
     Disk-->>Upload: 201 and committed metadata
@@ -109,7 +109,7 @@ conflict and the journal is retained.
 - **Atomic create:** `If-None-Match: *` never exposes a partial destination and
   never replaces an existing destination. The transaction bytes and metadata
   are synced before the destination link is published.
-- **Acknowledged Windows new-file data:** WinFSP acknowledges new-file writes
+- **Acknowledged new-file data:** WinFSP and FUSE acknowledge new-file writes
   only after the local journal state is synced. The journal remains until the
   server confirms a durable commit.
 - **Crash recovery:** incomplete temporary journal creation is discarded;

@@ -8,7 +8,6 @@ mod ownership;
 mod remote_path;
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
 mod writeback;
 
 #[cfg(not(windows))]
@@ -172,7 +171,13 @@ fn main() {
     ];
 
     // Create the FUSE filesystem instance
-    let fs = fuse::RemoteFs::new(&args.server_url);
+    let fs = match fuse::RemoteFs::new(&args.server_url) {
+        Ok(fs) => fs,
+        Err(error) => {
+            log::error!("Failed to initialize filesystem: {error}");
+            std::process::exit(1);
+        }
+    };
 
     if args.serve_daemon_mode {
         if let Err(e) = fuser::mount2(fs, &args.mountpoint, &options) {

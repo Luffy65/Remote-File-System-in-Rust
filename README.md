@@ -49,9 +49,15 @@ in [the protocol v1 document](docs/protocol-v1.md).
 - Optional local caching layer for performance
 - Configurable cache invalidation strategy (e.g., TTL or LRU)
 
-### Windows durable write journal
+### Cross-platform durable write journal
 
-New Windows files are written to a durable local journal before WinFSP reports a successful write. A bounded background uploader then sends the complete file through the normal `PUT /files/path` endpoint using standard `If-None-Match: *` create-only semantics. The server streams the upload into a transaction file, flushes it to durable storage, and atomically commits it without overwriting a conflicting remote path.
+New files are written to a durable local journal before WinFSP or FUSE reports
+a successful write. A bounded background uploader then sends the complete file
+through the normal `PUT /files/path` endpoint using standard
+`If-None-Match: *` create-only semantics. The server streams the upload into a
+transaction file, flushes it to durable storage, and atomically commits it
+without overwriting a conflicting remote path. Modifications to files that
+already exist on the server remain synchronous.
 
 This applies to newly created files of any size and has two separate timing boundaries:
 
@@ -60,7 +66,16 @@ This applies to newly created files of any size and has two separate timing boun
 
 If an upload fails, the journal is retained and retried when the client restarts. If the remote path exists with different contents, the client retains the journal and logs a conflict instead of silently overwriting either version. `REMOTE_FS_UPLOAD_CONCURRENCY` controls the bounded uploader concurrency and defaults to `8`.
 
-The default Windows journal location is `%LOCALAPPDATA%\remote-fs\journal\server-HASH`. Set `REMOTE_FS_JOURNAL_DIR` before mounting to choose a different durable base directory. Do not place it on a temporary/RAM disk. Overwriting or shrinking a pending file uses a copy-on-write generation and can temporarily require approximately twice that file's local disk space; sequential growth stays in place. The guarantee assumes at least one journal/server disk remains readable; no software can preserve data after simultaneous physical loss of every copy.
+Default journal locations are `%LOCALAPPDATA%\remote-fs\journal\server-HASH`
+on Windows, `~/Library/Application Support/remote-fs/journal/server-HASH` on
+macOS, and `${XDG_STATE_HOME:-~/.local/state}/remote-fs/journal/server-HASH` on
+Linux. Set `REMOTE_FS_JOURNAL_DIR` before mounting to choose a different
+durable base directory. Do not place it on a temporary/RAM disk. Overwriting or
+shrinking a pending file uses a copy-on-write generation and can temporarily
+require approximately twice that file's local disk space; sequential growth
+stays in place. The guarantee assumes at least one journal/server disk remains
+readable; no software can preserve data after simultaneous physical loss of
+every copy.
 
 ## Non-Functional Requirements
 
@@ -231,14 +246,24 @@ sparse file still transfers 1 GiB in each direction. Add
 `--skip-mounted-large-read` to omit the second large-file download while keeping
 the full server-side SHA-256 verification.
 
-#### Forced client-crash recovery test (Windows journal)
+#### Forced client-crash recovery test
 
-This deliberately leaves journal entries pending, kills the client, and verifies that the next client process replays every byte. First mount the Windows client with uploads paused:
+This deliberately leaves journal entries pending, kills the client, and
+verifies that the next client process replays every byte. First mount the
+client with uploads paused. Windows:
 
 ```powershell
 $env:REMOTE_FS_TOKEN = "replace-with-your-token"
 $env:REMOTE_FS_UPLOAD_PAUSED = "1"
 cargo run -p client -- R: http://192.168.1.19:3000
+```
+
+macOS/Linux:
+
+```sh
+export REMOTE_FS_TOKEN="replace-with-your-token"
+export REMOTE_FS_UPLOAD_PAUSED="1"
+cargo run -p client -- ./test_folder http://192.168.1.17:3000
 ```
 
 In another PowerShell terminal, create and hash the recovery payloads:
@@ -255,12 +280,29 @@ By default this prepares 32 small files plus one 16 MiB multi-chunk file. Use
 `--recovery-count` and `--recovery-large-mib` to make the crash workload larger,
 or `--recovery-large-mib 0` to omit the large file.
 
+On macOS/Linux, use:
+
+```sh
+python3 ./scripts/e2e_stress.py prepare-recovery \
+  --mount ./test_folder \
+  --server-url http://192.168.1.17:3000 \
+  --state-file ./remote-fs-recovery-state.json
+```
+
 Force-kill that client process, remove `REMOTE_FS_UPLOAD_PAUSED`, and remount normally:
 
 ```powershell
 Stop-Process -Name client -Force
 Remove-Item Env:REMOTE_FS_UPLOAD_PAUSED
 cargo run -p client -- R: http://192.168.1.19:3000
+```
+
+On macOS/Linux, force-kill the client, clear the pause variable, and remount:
+
+```sh
+pkill -9 client
+unset REMOTE_FS_UPLOAD_PAUSED
+cargo run -p client -- ./test_folder http://192.168.1.17:3000
 ```
 
 Finally, verify that the restarted client replayed every journal entry and that the mounted and server hashes match:
@@ -272,7 +314,18 @@ python .\scripts\e2e_stress.py verify-recovery `
   --state-file .\remote-fs-recovery-state.json
 ```
 
-`REMOTE_FS_UPLOAD_PAUSED` exists only for this crash-recovery test; never enable it for normal use. The normal E2E suite is client/server platform-independent. The forced-crash phase currently targets the Windows write journal and should be extended to FUSE when the same write-behind mechanism is enabled there.
+macOS/Linux:
+
+```sh
+python3 ./scripts/e2e_stress.py verify-recovery \
+  --mount ./test_folder \
+  --server-url http://192.168.1.17:3000 \
+  --state-file ./remote-fs-recovery-state.json
+```
+
+`REMOTE_FS_UPLOAD_PAUSED` exists only for this crash-recovery test; never enable
+it for normal use. Both the normal and forced-crash suites are client/server
+platform-independent.
 
 ## Project roadmap / TODO
 
@@ -345,7 +398,7 @@ time, and protocol overhead separately before optimizing code.
 - [ ] Define conflict behavior, cache invalidation, rename semantics, and optional
   file locking or leases for concurrent clients.
 - [ ] Extend durable write journaling and crash replay to modifications of
-  existing files and to FUSE clients, not only new Windows files.
+  existing files. Newly created files already use it on WinFSP and FUSE.
 - [ ] Test simultaneous Windows, macOS, and Linux clients against every supported
   server platform.
 - [ ] Add snapshots/version history and a documented backup/restore procedure.

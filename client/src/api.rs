@@ -3,29 +3,24 @@ use remote_fs_protocol::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RenameReques
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::{
     fmt::Write,
+    io,
+    path::Path,
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[cfg(windows)]
-use std::{io, path::Path};
-#[cfg(windows)]
 use tokio::io::AsyncReadExt;
-#[cfg(windows)]
 use tokio_util::io::ReaderStream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-#[cfg(windows)]
 const COMPARE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-#[cfg(windows)]
 #[derive(Debug)]
 pub enum UploadError {
     Io(io::Error),
     Http(reqwest::Error),
 }
 
-#[cfg(windows)]
 impl UploadError {
     pub fn status(&self) -> Option<reqwest::StatusCode> {
         match self {
@@ -35,7 +30,6 @@ impl UploadError {
     }
 }
 
-#[cfg(windows)]
 impl std::fmt::Display for UploadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -45,17 +39,14 @@ impl std::fmt::Display for UploadError {
     }
 }
 
-#[cfg(windows)]
 impl std::error::Error for UploadError {}
 
-#[cfg(windows)]
 impl From<io::Error> for UploadError {
     fn from(error: io::Error) -> Self {
         UploadError::Io(error)
     }
 }
 
-#[cfg(windows)]
 impl From<reqwest::Error> for UploadError {
     fn from(error: reqwest::Error) -> Self {
         UploadError::Http(error)
@@ -231,29 +222,6 @@ pub async fn create_directory(
     response.error_for_status()?.json::<RemoteMetadata>().await
 }
 
-// Sends an empty file to the server
-#[cfg(not(windows))]
-pub async fn create_file(
-    base_url: &str,
-    path: &str,
-    mode: u32,
-) -> Result<RemoteMetadata, reqwest::Error> {
-    let request_url = endpoint_url(base_url, "files", path);
-
-    log::debug!("API: Creating new empty file via PUT {}", request_url);
-
-    let client = http_client();
-    let request = authenticated(client.put(&request_url))
-        .header(headers::FILE_OFFSET, "0")
-        .body(vec![]);
-    let response = add_optional_metadata_headers(request, Some(mode), None, None, None)
-        .send()
-        .await?;
-
-    response.error_for_status()?.json::<RemoteMetadata>().await
-}
-
-#[cfg(windows)]
 pub async fn conditionally_create_file_from_path(
     base_url: &str,
     path: &str,
@@ -278,7 +246,6 @@ pub async fn conditionally_create_file_from_path(
         .await?)
 }
 
-#[cfg(windows)]
 pub async fn remote_file_matches_local(
     base_url: &str,
     path: &str,
