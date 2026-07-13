@@ -3,6 +3,8 @@ mod api;
 mod cache;
 #[cfg(not(windows))]
 mod fuse;
+#[cfg(not(windows))]
+mod ownership;
 mod remote_path;
 #[cfg(windows)]
 mod windows;

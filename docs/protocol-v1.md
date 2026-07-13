@@ -35,6 +35,9 @@ additive JSON fields should remain optional to preserve v1 compatibility.
 `DirectoryEntry` adds `name` to the same fields. `type` is `file` or
 `directory`; directory size is `0`; `modified_at` is Unix seconds encoded as a
 decimal string. `mode`, `uid`, and `gid` are nullable for portability.
+Unix servers return their real UID/GID. Servers without Unix ownership, such
+as Windows, return `null`; FUSE clients then expose the entry as owned by the
+local user who mounted the filesystem.
 
 `POST /rename` accepts:
 

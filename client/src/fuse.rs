@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api;
-use crate::{cache::TtlLruCache, remote_path};
+use crate::{cache::TtlLruCache, ownership, remote_path};
 
 // Keep the long fuser::Filesystem callback implementation separate from
 // the state/cache helpers in this file.
@@ -77,14 +77,16 @@ fn attr_from_directory_entry(ino: u64, entry: &api::DirectoryEntry) -> FileAttr 
         .map(|mode| (mode & 0o7777) as u16)
         .unwrap_or_else(|| default_perm(kind));
     let modified_at = system_time_from_unix_seconds(&entry.modified_at);
+    let mounting_uid = unsafe { libc::getuid() as u32 };
+    let mounting_gid = unsafe { libc::getgid() as u32 };
 
     create_file_attr(
         ino,
         kind,
         entry.size,
         perm,
-        entry.uid.unwrap_or(0),
-        entry.gid.unwrap_or(0),
+        ownership::remote_or_mounting_user(entry.uid, mounting_uid),
+        ownership::remote_or_mounting_user(entry.gid, mounting_gid),
         modified_at,
     )
 }
@@ -96,14 +98,16 @@ fn attr_from_remote_metadata(ino: u64, metadata: &api::RemoteMetadata) -> FileAt
         .map(|mode| (mode & 0o7777) as u16)
         .unwrap_or_else(|| default_perm(kind));
     let modified_at = system_time_from_unix_seconds(&metadata.modified_at);
+    let mounting_uid = unsafe { libc::getuid() as u32 };
+    let mounting_gid = unsafe { libc::getgid() as u32 };
 
     create_file_attr(
         ino,
         kind,
         metadata.size,
         perm,
-        metadata.uid.unwrap_or(0),
-        metadata.gid.unwrap_or(0),
+        ownership::remote_or_mounting_user(metadata.uid, mounting_uid),
+        ownership::remote_or_mounting_user(metadata.gid, mounting_gid),
         modified_at,
     )
 }

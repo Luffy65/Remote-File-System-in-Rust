@@ -17,6 +17,7 @@ server/
   error.rs                Stable HTTP error mapping
 client/
   api.rs                  HTTP transport used by both platform adapters
+  ownership.rs            Portable remote-to-local UID/GID fallback
   remote_path.rs          Pure slash-path helpers
   fuse.rs + fuse/ops.rs   FUSE state/cache helpers and kernel callbacks
   windows.rs              WinFSP mount, handles, and operation helpers

@@ -46,23 +46,23 @@ fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
 }
 
 #[cfg(unix)]
-fn metadata_uid(metadata: &std::fs::Metadata) -> u32 {
-    metadata.uid()
+fn metadata_uid(metadata: &std::fs::Metadata) -> Option<u32> {
+    Some(metadata.uid())
 }
 
 #[cfg(not(unix))]
-fn metadata_uid(_metadata: &std::fs::Metadata) -> u32 {
-    0
+fn metadata_uid(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 #[cfg(unix)]
-fn metadata_gid(metadata: &std::fs::Metadata) -> u32 {
-    metadata.gid()
+fn metadata_gid(metadata: &std::fs::Metadata) -> Option<u32> {
+    Some(metadata.gid())
 }
 
 #[cfg(not(unix))]
-fn metadata_gid(_metadata: &std::fs::Metadata) -> u32 {
-    0
+fn metadata_gid(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 fn entry_type(metadata: &std::fs::Metadata) -> Option<String> {
@@ -90,8 +90,8 @@ pub(crate) fn entry_metadata_from_metadata(metadata: std::fs::Metadata) -> Optio
             .map(format_modified_at)
             .unwrap_or_else(|_| "0".to_string()),
         mode: Some(metadata_mode(&metadata)),
-        uid: Some(metadata_uid(&metadata)),
-        gid: Some(metadata_gid(&metadata)),
+        uid: metadata_uid(&metadata),
+        gid: metadata_gid(&metadata),
     })
 }
 
@@ -329,5 +329,20 @@ mod tests {
         headers_map.clear();
         headers_map.insert(headers::FILE_MODE, "10000".parse().unwrap());
         assert!(parse_optional_mode_header(&headers_map).is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_metadata_marks_uid_and_gid_as_unsupported() {
+        let path = std::env::temp_dir().join(format!(
+            "remote-fs-metadata-owner-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"owner test").unwrap();
+        let metadata = entry_metadata_from_metadata(std::fs::metadata(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(metadata.uid, None);
+        assert_eq!(metadata.gid, None);
     }
 }
