@@ -28,6 +28,8 @@ const STATUS_UNEXPECTED_IO_ERROR: i32 = 0xC000_00E9u32 as i32;
 const ERROR_DIR_NOT_EMPTY: u32 = 145;
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(1);
 const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
+const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(1);
+const DIRECTORY_CACHE_MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EntryKind {
@@ -49,6 +51,12 @@ struct CachedRemoteEntry {
     cached_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct CachedDirectoryEntries {
+    entries: Vec<DirectoryEntry>,
+    cached_at: Instant,
+}
+
 struct WinHandle {
     path: Mutex<String>,
     kind: EntryKind,
@@ -61,6 +69,7 @@ struct RemoteWinFs {
     server_addr: String,
     runtime: tokio::runtime::Runtime,
     metadata_cache: Mutex<HashMap<String, CachedRemoteEntry>>,
+    directory_cache: Mutex<HashMap<String, CachedDirectoryEntries>>,
 }
 
 pub fn run(
@@ -72,6 +81,7 @@ pub fn run(
         server_addr: server_url.to_string(),
         runtime: tokio::runtime::Runtime::new()?,
         metadata_cache: Mutex::new(HashMap::new()),
+        directory_cache: Mutex::new(HashMap::new()),
     };
 
     let mut volume = VolumeParams::new();
@@ -177,6 +187,30 @@ impl RemoteWinFs {
         None
     }
 
+    fn cached_parent_metadata(&self, path: &str) -> Option<Result<RemoteEntry>> {
+        if path == "/" {
+            return None;
+        }
+
+        let parent = parent_path(path);
+        let name = path.rsplit('/').next().unwrap_or_default();
+        let mut cache = self.directory_cache.lock().unwrap();
+        let cached = cache.get(&parent)?;
+        if cached.cached_at.elapsed() > DIRECTORY_CACHE_TTL {
+            cache.remove(&parent);
+            return None;
+        }
+
+        Some(
+            cached
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(RemoteEntry::from_directory_entry)
+                .ok_or(FspError::IO(ErrorKind::NotFound)),
+        )
+    }
+
     fn cache_metadata(&self, path: &str, entry: &RemoteEntry) {
         let mut cache = self.metadata_cache.lock().unwrap();
         if cache.len() >= METADATA_CACHE_MAX_ENTRIES {
@@ -202,6 +236,83 @@ impl RemoteWinFs {
             .retain(|cached_path, _| cached_path != path && !cached_path.starts_with(&prefix));
     }
 
+    fn list_directory_cached(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
+        {
+            let mut cache = self.directory_cache.lock().unwrap();
+            if let Some(cached) = cache.get(path)
+                && cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL
+            {
+                return Ok(cached.entries.clone());
+            }
+            cache.remove(path);
+        }
+
+        let entries = self
+            .block_on(api::list_directory(&self.server_addr, Self::api_path(path)))
+            .map_err(|error| fsp_error_from_api(&error))?;
+        let mut cache = self.directory_cache.lock().unwrap();
+        if cache.len() >= DIRECTORY_CACHE_MAX_ENTRIES {
+            cache.retain(|_, cached| cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL);
+            if cache.len() >= DIRECTORY_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            path.to_string(),
+            CachedDirectoryEntries {
+                entries: entries.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+        Ok(entries)
+    }
+
+    fn update_directory_cache_for_path(&self, path: &str, entry: &RemoteEntry) {
+        if path == "/" {
+            return;
+        }
+        let parent = parent_path(path);
+        let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) else {
+            return;
+        };
+        let mut cache = self.directory_cache.lock().unwrap();
+        let Some(cached) = cache.get_mut(&parent) else {
+            return;
+        };
+        if cached.cached_at.elapsed() > DIRECTORY_CACHE_TTL {
+            cache.remove(&parent);
+            return;
+        }
+        cached.entries.retain(|item| item.name != name);
+        cached
+            .entries
+            .push(directory_entry_from_remote(name, entry));
+        cached
+            .entries
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        cached.cached_at = Instant::now();
+    }
+
+    fn remove_from_directory_cache(&self, path: &str) {
+        if path == "/" {
+            self.directory_cache.lock().unwrap().clear();
+            return;
+        }
+        let parent = parent_path(path);
+        let name = path.rsplit('/').next().unwrap_or_default();
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let mut cache = self.directory_cache.lock().unwrap();
+        cache.retain(|cached_path, _| cached_path != path && !cached_path.starts_with(&prefix));
+        if let Some(cached) = cache.get_mut(&parent) {
+            if cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL {
+                cached.entries.retain(|entry| entry.name != name);
+                cached.cached_at = Instant::now();
+            } else {
+                cache.remove(&parent);
+            }
+        }
+    }
+
     fn metadata_for_path(&self, path: &str) -> Result<RemoteEntry> {
         if path == "/" {
             return Ok(RemoteEntry::root());
@@ -209,6 +320,10 @@ impl RemoteWinFs {
 
         if let Some(entry) = self.cached_metadata(path) {
             return Ok(entry);
+        }
+
+        if let Some(entry) = self.cached_parent_metadata(path) {
+            return entry;
         }
 
         let metadata = self
@@ -237,6 +352,7 @@ impl RemoteWinFs {
         };
         if result.is_ok() {
             self.invalidate_metadata_tree(path);
+            self.remove_from_directory_cache(path);
         }
         result
     }
@@ -328,6 +444,7 @@ impl FileSystemContext for RemoteWinFs {
         };
         let entry = RemoteEntry::from_metadata(&metadata);
         self.cache_metadata(&path, &entry);
+        self.update_directory_cache_for_path(&path, &entry);
         fill_file_info(file_info.as_mut(), &path, &entry);
         Ok(WinHandle::new(path, entry))
     }
@@ -385,6 +502,7 @@ impl FileSystemContext for RemoteWinFs {
         let entry = RemoteEntry::from_metadata(&metadata);
         context.update_entry(entry.clone());
         self.cache_metadata(&path, &entry);
+        self.update_directory_cache_for_path(&path, &entry);
         fill_file_info(file_info, &path, &entry);
         Ok(())
     }
@@ -402,12 +520,7 @@ impl FileSystemContext for RemoteWinFs {
 
         if marker.is_none() {
             let path = context.path();
-            let entries = self
-                .block_on(api::list_directory(
-                    &self.server_addr,
-                    Self::api_path(&path),
-                ))
-                .map_err(|error| fsp_error_from_api(&error))?;
+            let entries = self.list_directory_cached(&path)?;
             let lock = context
                 .dir_buffer
                 .acquire(true, Some(entries.len() as u32 + 2))?;
@@ -448,6 +561,7 @@ impl FileSystemContext for RemoteWinFs {
         .map_err(|error| fsp_error_from_api(&error))?;
 
         self.metadata_cache.lock().unwrap().clear();
+        self.directory_cache.lock().unwrap().clear();
         *context.path.lock().unwrap() = to.clone();
         self.cache_metadata(&to, &context.entry());
         Ok(())
@@ -479,6 +593,7 @@ impl FileSystemContext for RemoteWinFs {
             let entry = RemoteEntry::from_metadata(&metadata);
             context.update_entry(entry.clone());
             self.cache_metadata(&path, &entry);
+            self.update_directory_cache_for_path(&path, &entry);
             fill_file_info(file_info, &path, &entry);
         } else {
             fill_file_info(file_info, &path, &context.entry());
@@ -523,6 +638,7 @@ impl FileSystemContext for RemoteWinFs {
         let entry = RemoteEntry::from_metadata(&metadata);
         context.update_entry(entry.clone());
         self.cache_metadata(&path, &entry);
+        self.update_directory_cache_for_path(&path, &entry);
         fill_file_info(file_info, &path, &entry);
         Ok(())
     }
@@ -583,6 +699,7 @@ impl FileSystemContext for RemoteWinFs {
         let entry = RemoteEntry::from_metadata(&metadata);
         context.update_entry(entry.clone());
         self.cache_metadata(&path, &entry);
+        self.update_directory_cache_for_path(&path, &entry);
         fill_file_info(file_info, &path, &entry);
         Ok(buffer.len() as u32)
     }
@@ -639,6 +756,20 @@ fn child_path(parent: &str, name: &str) -> String {
         format!("/{name}")
     } else {
         format!("{}/{}", parent.trim_end_matches('/'), name)
+    }
+}
+
+fn directory_entry_from_remote(name: &str, entry: &RemoteEntry) -> DirectoryEntry {
+    DirectoryEntry {
+        name: name.to_string(),
+        type_: match entry.kind {
+            EntryKind::File => "file",
+            EntryKind::Directory => "directory",
+        }
+        .to_string(),
+        size: entry.size,
+        modified_at: entry.modified_at.clone(),
+        mode: entry.mode,
     }
 }
 
