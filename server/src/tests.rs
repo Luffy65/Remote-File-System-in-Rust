@@ -47,6 +47,143 @@ fn app_for_root_with_token(root: PathBuf, token: &str) -> Router {
 }
 
 #[tokio::test]
+async fn test_conditional_put_atomically_creates_file() {
+    let root = TestRoot::new("conditional-create");
+    let app = app_for_root(root.path());
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/created.txt")
+        .header("if-none-match", "*")
+        .header("X-File-Mode", "640")
+        .body(Body::from("durable payload"))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        std::fs::read(root.path.join("created.txt")).unwrap(),
+        b"durable payload"
+    );
+
+    let listing = Request::builder()
+        .uri("/list/")
+        .body(Body::empty())
+        .unwrap();
+    let body = to_bytes(app.oneshot(listing).await.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 1);
+    assert_eq!(entries[0]["name"], "created.txt");
+}
+
+#[tokio::test]
+async fn test_conditional_put_never_overwrites_existing_file() {
+    let root = TestRoot::new("conditional-conflict");
+    std::fs::write(root.path.join("existing.txt"), b"original").unwrap();
+    let app = app_for_root(root.path());
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/existing.txt")
+        .header("if-none-match", "*")
+        .body(Body::from("replacement"))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        std::fs::read(root.path.join("existing.txt")).unwrap(),
+        b"original"
+    );
+}
+
+#[tokio::test]
+async fn test_conditional_put_body_failure_leaves_no_partial_file() {
+    let root = TestRoot::new("conditional-body-failure");
+    let app = app_for_root(root.path());
+    let body = Body::from_stream(futures_util::stream::iter([
+        Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
+        Err(io::Error::other("simulated disconnect")),
+    ]));
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/disconnected.bin")
+        .header("if-none-match", "*")
+        .body(body)
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!root.path.join("disconnected.bin").exists());
+    assert_eq!(
+        std::fs::read_dir(root.path.join(INTERNAL_DIR_NAME))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_conditional_puts_commit_exactly_one_file() {
+    let root = TestRoot::new("conditional-race");
+    let app = app_for_root(root.path());
+    let first = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/race.bin")
+        .header("if-none-match", "*")
+        .body(Body::from("first"))
+        .unwrap();
+    let second = Request::builder()
+        .method(Method::PUT)
+        .uri("/files/race.bin")
+        .header("if-none-match", "*")
+        .body(Body::from("second"))
+        .unwrap();
+
+    let (first_response, second_response) =
+        tokio::join!(app.clone().oneshot(first), app.oneshot(second));
+    let statuses = [
+        first_response.unwrap().status(),
+        second_response.unwrap().status(),
+    ];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::PRECONDITION_FAILED)
+            .count(),
+        1
+    );
+    assert!(matches!(
+        std::fs::read(root.path.join("race.bin"))
+            .unwrap()
+            .as_slice(),
+        b"first" | b"second"
+    ));
+}
+
+#[tokio::test]
+async fn test_internal_transaction_directory_is_not_addressable() {
+    let root = TestRoot::new("internal-directory");
+    let app = app_for_root(root.path());
+    let request = Request::builder()
+        .uri("/list/.remote-fs-transactions")
+        .body(Body::empty())
+        .unwrap();
+
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
 async fn test_file_chunked_upload() {
     // 1. Start with an empty disk-backed server root.
     let root = TestRoot::new("chunked-upload");

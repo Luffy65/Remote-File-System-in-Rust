@@ -11,7 +11,10 @@
 use axum::{
     body::Body,
     extract::{Path as AxumPath, State},
-    http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
+    http::{
+        header::{AUTHORIZATION, IF_NONE_MATCH},
+        HeaderMap, Request, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -24,7 +27,10 @@ use std::{
     io::SeekFrom,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -44,6 +50,8 @@ use std::os::unix::{
 const DEFAULT_STORAGE_ROOT: &str = "remote-storage";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:3000";
 const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const INTERNAL_DIR_NAME: &str = ".remote-fs-transactions";
+static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(unix))]
 const DEFAULT_FILE_MODE: u32 = 0o644;
 #[cfg(not(unix))]
@@ -51,14 +59,21 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 
 struct AppState {
     root_dir: PathBuf,
+    transaction_dir: PathBuf,
     auth_token: Option<String>,
+    mutation_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
     fn with_auth(root_dir: PathBuf, auth_token: Option<String>) -> Self {
+        let transaction_dir = root_dir.join(INTERNAL_DIR_NAME);
+        std::fs::create_dir_all(&transaction_dir)
+            .expect("failed to create server transaction directory");
         AppState {
             root_dir,
+            transaction_dir,
             auth_token,
+            mutation_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -66,6 +81,7 @@ impl AppState {
     // as well as symlink/reparse-point components that could escape the root.
     fn resolve_path(&self, path: &str) -> Result<PathBuf, StorageError> {
         let relative_path = sanitize_api_path(path)?;
+        reject_internal_path(&relative_path)?;
         self.reject_link_components(&relative_path)?;
         Ok(self.root_dir.join(relative_path))
     }
@@ -78,6 +94,7 @@ impl AppState {
             return Err(StorageError::BadRequest("Path cannot be empty"));
         }
 
+        reject_internal_path(&relative_path)?;
         self.reject_link_components(&relative_path)?;
         Ok(self.root_dir.join(relative_path))
     }
@@ -133,6 +150,7 @@ enum StorageError {
     NotFound(&'static str),
     Forbidden(&'static str),
     Conflict(&'static str),
+    PreconditionFailed(&'static str),
     RequestBody(&'static str),
     Io(io::Error),
 }
@@ -159,6 +177,9 @@ impl IntoResponse for StorageError {
             StorageError::NotFound(message) => (StatusCode::NOT_FOUND, message).into_response(),
             StorageError::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
             StorageError::Conflict(message) => (StatusCode::CONFLICT, message).into_response(),
+            StorageError::PreconditionFailed(message) => {
+                (StatusCode::PRECONDITION_FAILED, message).into_response()
+            }
             StorageError::RequestBody(message) => {
                 (StatusCode::BAD_REQUEST, message).into_response()
             }
@@ -224,6 +245,17 @@ fn sanitize_api_path(path: &str) -> Result<PathBuf, StorageError> {
     }
 
     Ok(relative_path)
+}
+
+fn reject_internal_path(path: &Path) -> Result<(), StorageError> {
+    if path
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == INTERNAL_DIR_NAME)
+    {
+        return Err(StorageError::Forbidden("Path is reserved by the server"));
+    }
+    Ok(())
 }
 
 fn bearer_token_matches(header_value: &str, expected_token: &str) -> bool {
@@ -583,6 +615,9 @@ async fn list_entries(state: &AppState, path: &str) -> Result<Vec<DirectoryEntry
         .map_err(|error| StorageError::from_io(error, "Could not read directory"))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
+        if path.trim_matches('/').is_empty() && name == INTERNAL_DIR_NAME {
+            continue;
+        }
         let metadata = entry
             .metadata()
             .await
@@ -715,6 +750,150 @@ async fn get_file(
     Ok((StatusCode::OK, Body::from_stream(stream)).into_response())
 }
 
+async fn sync_directory(path: PathBuf) -> Result<(), StorageError> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    tokio::task::spawn_blocking(move || {
+        let directory = std::fs::File::open(path);
+        directory?.sync_all()
+    })
+    .await
+    .map_err(|error| StorageError::Io(io::Error::other(error)))?
+    .map_err(|error| StorageError::from_io(error, "Could not sync directory"))
+}
+
+async fn create_file_atomically(
+    path: &str,
+    file_path: &Path,
+    headers: &HeaderMap,
+    state: &AppState,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let transaction_id = TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let transaction_path = state.transaction_dir.join(format!(
+        "upload-{}-{transaction_id}.tmp",
+        std::process::id()
+    ));
+
+    let mut transaction_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&transaction_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not create transaction file"))?;
+
+    let mut body_stream = body.into_data_stream();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                drop(transaction_file);
+                let _ = fs::remove_file(&transaction_path).await;
+                return Err(StorageError::RequestBody("Could not read request body"));
+            }
+        };
+        if let Err(error) = transaction_file.write_all(&chunk).await {
+            drop(transaction_file);
+            let _ = fs::remove_file(&transaction_path).await;
+            return Err(StorageError::from_io(
+                error,
+                "Could not write transaction file",
+            ));
+        }
+    }
+
+    if let Err(error) = transaction_file.sync_all().await {
+        drop(transaction_file);
+        let _ = fs::remove_file(&transaction_path).await;
+        return Err(StorageError::from_io(
+            error,
+            "Could not sync transaction file",
+        ));
+    }
+    if let Err(error) = apply_metadata_headers(&transaction_path, headers).await {
+        drop(transaction_file);
+        let _ = fs::remove_file(&transaction_path).await;
+        return Err(error);
+    }
+    if let Err(error) = transaction_file.sync_all().await {
+        drop(transaction_file);
+        let _ = fs::remove_file(&transaction_path).await;
+        return Err(StorageError::from_io(
+            error,
+            "Could not sync transaction metadata",
+        ));
+    }
+    drop(transaction_file);
+
+    let _mutation_guard = state.mutation_lock.lock().await;
+    match fs::symlink_metadata(file_path).await {
+        Ok(_) => {
+            let _ = fs::remove_file(&transaction_path).await;
+            return Err(StorageError::PreconditionFailed(
+                "Destination path already exists",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = fs::remove_file(&transaction_path).await;
+            return Err(StorageError::from_io(
+                error,
+                "Could not inspect destination path",
+            ));
+        }
+    }
+
+    let parent = file_path
+        .parent()
+        .ok_or(StorageError::BadRequest("Path has no parent directory"))?;
+    if let Err(error) = fs::create_dir_all(parent).await {
+        let _ = fs::remove_file(&transaction_path).await;
+        return Err(StorageError::from_io(
+            error,
+            "Could not create parent directory",
+        ));
+    }
+    if let Err(error) = fs::hard_link(&transaction_path, file_path).await {
+        let _ = fs::remove_file(&transaction_path).await;
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            return Err(StorageError::PreconditionFailed(
+                "Destination path already exists",
+            ));
+        }
+        return Err(StorageError::from_io(
+            error,
+            "Could not commit transaction file",
+        ));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file_path)
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not reopen committed file"))?
+        .sync_all()
+        .await
+        .map_err(|error| StorageError::from_io(error, "Could not sync committed file"))?;
+    sync_directory(parent.to_path_buf()).await?;
+    if let Err(error) = fs::remove_file(&transaction_path).await {
+        log::warn!(
+            "Committed /{}, but could not remove transaction link: {error}",
+            path.trim_matches('/')
+        );
+    } else {
+        sync_directory(state.transaction_dir.clone()).await?;
+    }
+
+    let metadata = entry_metadata_for_path(file_path).await?;
+    log::info!("Atomically created /{}", path.trim_matches('/'));
+    Ok((StatusCode::CREATED, Json(metadata)).into_response())
+}
+
 // Handler for `PUT /files/*path`: streams the request body to disk at the requested offset.
 async fn write_file(
     AxumPath(path): AxumPath<String>,
@@ -725,6 +904,18 @@ async fn write_file(
     let file_path = state.resolve_non_root_path(&path)?;
     let offset = parse_optional_u64_header(&headers, "X-File-Offset")?.unwrap_or(0);
     let truncate_size = parse_optional_u64_header(&headers, "X-File-Truncate")?;
+
+    if headers
+        .get(IF_NONE_MATCH)
+        .is_some_and(|value| value.as_bytes() == b"*")
+    {
+        if offset != 0 || truncate_size.is_some() {
+            return Err(StorageError::BadRequest(
+                "Conditional creation does not support offsets or truncation",
+            ));
+        }
+        return create_file_atomically(&path, &file_path, &headers, &state, body).await;
+    }
 
     log::debug!(
         "Receiving streamed bytes for /{} (offset: {})",
@@ -752,11 +943,11 @@ async fn write_file(
         file.set_len(size)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not resize file"))?;
-        file.flush()
+        apply_metadata_headers(&file_path, &headers).await?;
+        file.sync_all()
             .await
             .map_err(|error| StorageError::from_io(error, "Could not flush file"))?;
         drop(file);
-        apply_metadata_headers(&file_path, &headers).await?;
         let metadata = entry_metadata_for_path(&file_path).await?;
         log::info!("Resized /{} to {} bytes", path.trim_matches('/'), size);
         return Ok((StatusCode::OK, Json(metadata)).into_response());
@@ -798,22 +989,21 @@ async fn write_file(
         file.set_len(0)
             .await
             .map_err(|error| StorageError::from_io(error, "Could not truncate file"))?;
-        file.flush()
+        apply_metadata_headers(&file_path, &headers).await?;
+        file.sync_all()
             .await
             .map_err(|error| StorageError::from_io(error, "Could not flush file"))?;
         drop(file);
-        apply_metadata_headers(&file_path, &headers).await?;
         let metadata = entry_metadata_for_path(&file_path).await?;
         log::info!("Created or truncated /{}", path.trim_matches('/'));
         return Ok((StatusCode::OK, Json(metadata)).into_response());
     }
 
-    file.flush()
+    apply_metadata_headers(&file_path, &headers).await?;
+    file.sync_all()
         .await
         .map_err(|error| StorageError::from_io(error, "Could not flush file"))?;
     drop(file);
-
-    apply_metadata_headers(&file_path, &headers).await?;
     let metadata = entry_metadata_for_path(&file_path).await?;
     log::info!(
         "Wrote /{} (offset: {}, bytes: {})",

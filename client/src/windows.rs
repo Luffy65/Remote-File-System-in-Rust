@@ -1,10 +1,11 @@
 use crate::api::{self, DirectoryEntry, RemoteMetadata};
+use crate::writeback::{PendingFile, Writeback};
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     ffi::{OsStr, c_void},
     hash::{Hash, Hasher},
     io::ErrorKind,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use winfsp::{
@@ -61,6 +62,7 @@ struct WinHandle {
     path: Mutex<String>,
     kind: EntryKind,
     entry: Mutex<RemoteEntry>,
+    pending: Option<Arc<PendingFile>>,
     delete_on_cleanup: Mutex<bool>,
     dir_buffer: DirBuffer,
 }
@@ -68,6 +70,7 @@ struct WinHandle {
 struct RemoteWinFs {
     server_addr: String,
     runtime: tokio::runtime::Runtime,
+    writeback: Writeback,
     metadata_cache: Mutex<HashMap<String, CachedRemoteEntry>>,
     directory_cache: Mutex<HashMap<String, CachedDirectoryEntries>>,
 }
@@ -77,9 +80,13 @@ pub fn run(
     server_url: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _winfsp = winfsp::winfsp_init()?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let writeback = Writeback::new(server_url, runtime.handle().clone())?;
+    writeback.start_recovery();
     let fs = RemoteWinFs {
         server_addr: server_url.to_string(),
-        runtime: tokio::runtime::Runtime::new()?,
+        runtime,
+        writeback,
         metadata_cache: Mutex::new(HashMap::new()),
         directory_cache: Mutex::new(HashMap::new()),
     };
@@ -141,14 +148,29 @@ impl RemoteEntry {
             mode: metadata.mode,
         }
     }
+
+    fn from_pending(pending: &PendingFile) -> std::io::Result<Self> {
+        let metadata = pending.metadata()?;
+        Ok(RemoteEntry {
+            kind: EntryKind::File,
+            size: metadata.size,
+            modified_at: metadata.modified_at,
+            mode: Some(metadata.mode),
+        })
+    }
 }
 
 impl WinHandle {
-    fn new(path: String, entry: RemoteEntry) -> Self {
+    fn new_with_pending(
+        path: String,
+        entry: RemoteEntry,
+        pending: Option<Arc<PendingFile>>,
+    ) -> Self {
         WinHandle {
             path: Mutex::new(path),
             kind: entry.kind,
             entry: Mutex::new(entry),
+            pending,
             delete_on_cleanup: Mutex::new(false),
             dir_buffer: DirBuffer::new(),
         }
@@ -247,9 +269,19 @@ impl RemoteWinFs {
             cache.remove(path);
         }
 
-        let entries = self
+        let mut entries = self
             .block_on(api::list_directory(&self.server_addr, Self::api_path(path)))
             .map_err(|error| fsp_error_from_api(&error))?;
+        for pending in self.writeback.entries_in_directory(path) {
+            if pending.is_committed() {
+                continue;
+            }
+            let entry = remote_entry_for_pending(&pending)?;
+            let name = pending.path().rsplit('/').next().unwrap_or_default();
+            entries.retain(|existing| existing.name != name);
+            entries.push(directory_entry_from_remote(name, &entry));
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
         let mut cache = self.directory_cache.lock().unwrap();
         if cache.len() >= DIRECTORY_CACHE_MAX_ENTRIES {
             cache.retain(|_, cached| cached.cached_at.elapsed() <= DIRECTORY_CACHE_TTL);
@@ -318,6 +350,12 @@ impl RemoteWinFs {
             return Ok(RemoteEntry::root());
         }
 
+        if let Some(pending) = self.writeback.get(path)
+            && !pending.is_committed()
+        {
+            return remote_entry_for_pending(&pending);
+        }
+
         if let Some(entry) = self.cached_metadata(path) {
             return Ok(entry);
         }
@@ -338,6 +376,25 @@ impl RemoteWinFs {
         let entry = self.metadata_for_path(path)?;
         fill_file_info(info, path, &entry);
         Ok(entry)
+    }
+
+    fn materialize_pending(&self, context: &WinHandle) -> Result<Option<RemoteEntry>> {
+        let Some(pending) = &context.pending else {
+            return Ok(None);
+        };
+        if let Some(metadata) = pending.committed_metadata() {
+            let entry = RemoteEntry::from_metadata(&metadata);
+            context.update_entry(entry.clone());
+            return Ok(Some(entry));
+        }
+
+        let metadata = self.writeback.flush(pending).map_err(fsp_error_from_io)?;
+        let entry = RemoteEntry::from_metadata(&metadata);
+        context.update_entry(entry.clone());
+        let path = context.path();
+        self.cache_metadata(&path, &entry);
+        self.update_directory_cache_for_path(&path, &entry);
+        Ok(Some(entry))
     }
 
     fn delete_path(&self, path: &str, kind: EntryKind) -> Result<()> {
@@ -367,6 +424,9 @@ impl RemoteWinFs {
                 self.metadata_for_path(path)?;
             }
             EntryKind::Directory => {
+                if !self.writeback.entries_in_directory(path).is_empty() {
+                    return Err(FspError::WIN32(ERROR_DIR_NOT_EMPTY));
+                }
                 let entries = self
                     .block_on(api::list_directory(&self.server_addr, Self::api_path(path)))
                     .map_err(|error| fsp_error_from_api(&error))?;
@@ -408,10 +468,22 @@ impl FileSystemContext for RemoteWinFs {
     ) -> Result<Self::FileContext> {
         let path = normalize_winfsp_path(file_name);
         let entry = self.fill_file_info_for_path(&path, file_info.as_mut())?;
-        Ok(WinHandle::new(path, entry))
+        let pending = self.writeback.get(&path);
+        Ok(WinHandle::new_with_pending(path, entry, pending))
     }
 
-    fn close(&self, _context: Self::FileContext) {}
+    fn close(&self, context: Self::FileContext) {
+        if let Some(pending) = &context.pending
+            && !pending.is_committed()
+            && !*context.delete_on_cleanup.lock().unwrap()
+            && let Err(error) = self.writeback.enqueue(pending)
+        {
+            log::error!(
+                "Could not queue {} for upload; its durable journal was retained: {error}",
+                pending.path()
+            );
+        }
+    }
 
     fn create(
         &self,
@@ -428,25 +500,29 @@ impl FileSystemContext for RemoteWinFs {
         let path = normalize_winfsp_path(file_name);
         let api_path = Self::api_path(&path);
         let is_directory = create_options & FILE_DIRECTORY_FILE != 0;
-        let metadata = if is_directory {
-            self.block_on(api::create_directory(&self.server_addr, api_path, 0o755))
-                .map_err(|error| fsp_error_from_api(&error))?
-        } else {
+        let (entry, pending) = if is_directory {
             let metadata = self
-                .block_on(api::create_file(&self.server_addr, api_path, 0o644))
+                .block_on(api::create_directory(&self.server_addr, api_path, 0o755))
                 .map_err(|error| fsp_error_from_api(&error))?;
-            if let Some(bytes) = extra_buffer.filter(|bytes| !bytes.is_empty()) {
-                self.block_on(api::write_file(&self.server_addr, api_path, bytes, 0))
-                    .map_err(|error| fsp_error_from_api(&error))?
-            } else {
-                metadata
+            (RemoteEntry::from_metadata(&metadata), None)
+        } else {
+            let pending = self
+                .writeback
+                .stage_new(&path, 0o644)
+                .map_err(fsp_error_from_io)?;
+            if let Some(bytes) = extra_buffer.filter(|bytes| !bytes.is_empty())
+                && let Err(error) = pending.write_at(bytes, 0)
+            {
+                let _ = self.writeback.discard(&pending);
+                return Err(fsp_error_from_io(error));
             }
+            let entry = remote_entry_for_pending(&pending)?;
+            (entry, Some(pending))
         };
-        let entry = RemoteEntry::from_metadata(&metadata);
         self.cache_metadata(&path, &entry);
         self.update_directory_cache_for_path(&path, &entry);
         fill_file_info(file_info.as_mut(), &path, &entry);
-        Ok(WinHandle::new(path, entry))
+        Ok(WinHandle::new_with_pending(path, entry, pending))
     }
 
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
@@ -454,23 +530,56 @@ impl FileSystemContext for RemoteWinFs {
             || FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
         if delete {
             let path = context.path();
-            if let Err(error) = self.delete_path(&path, context.kind) {
+            let result = if let Some(pending) = &context.pending {
+                if pending.is_committed() {
+                    self.delete_path(&path, context.kind)
+                } else {
+                    self.writeback
+                        .discard(pending)
+                        .map_err(fsp_error_from_io)
+                        .or_else(|_| {
+                            self.materialize_pending(context)?;
+                            self.delete_path(&path, context.kind)
+                        })
+                }
+            } else {
+                self.delete_path(&path, context.kind)
+            };
+            if let Err(error) = result {
                 log::warn!("Failed to delete {path} during cleanup: {error:?}");
+            } else {
+                self.invalidate_metadata_tree(&path);
+                self.remove_from_directory_cache(&path);
             }
         }
     }
 
     fn flush(&self, context: Option<&Self::FileContext>, file_info: &mut FileInfo) -> Result<()> {
         if let Some(context) = context {
+            if let Some(pending) = &context.pending
+                && !pending.is_committed()
+            {
+                self.writeback.enqueue(pending).map_err(fsp_error_from_io)?;
+            }
             let path = context.path();
             fill_file_info(file_info, &path, &context.entry());
+        } else {
+            self.writeback.flush_all().map_err(fsp_error_from_io)?;
         }
         Ok(())
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
         let path = context.path();
-        let entry = self.metadata_for_path(&path)?;
+        let entry = if let Some(pending) = &context.pending {
+            if let Some(metadata) = pending.committed_metadata() {
+                RemoteEntry::from_metadata(&metadata)
+            } else {
+                remote_entry_for_pending(pending)?
+            }
+        } else {
+            self.metadata_for_path(&path)?
+        };
         context.update_entry(entry.clone());
         fill_file_info(file_info, &path, &entry);
         Ok(())
@@ -489,6 +598,7 @@ impl FileSystemContext for RemoteWinFs {
             return Err(FspError::IO(ErrorKind::IsADirectory));
         }
 
+        self.materialize_pending(context)?;
         let path = context.path();
         let current = self.metadata_for_path(&path)?;
         let mode = mode_after_overwrite(current.mode, file_attributes, replace_file_attributes);
@@ -552,6 +662,8 @@ impl FileSystemContext for RemoteWinFs {
         let from = normalize_winfsp_path(file_name);
         let to = normalize_winfsp_path(new_file_name);
 
+        self.materialize_pending(context)?;
+
         self.block_on(api::rename_file(
             &self.server_addr,
             Self::api_path(&from),
@@ -580,6 +692,7 @@ impl FileSystemContext for RemoteWinFs {
         let path = context.path();
         let mtime = system_time_from_filetime(last_write_time);
         if mtime.is_some() {
+            self.materialize_pending(context)?;
             let metadata = self
                 .block_on(api::update_metadata(
                     &self.server_addr,
@@ -628,6 +741,29 @@ impl FileSystemContext for RemoteWinFs {
         }
 
         let path = context.path();
+        if let Some(pending) = &context.pending
+            && !pending.is_committed()
+        {
+            match pending.resize(new_size) {
+                Ok(()) => {
+                    let entry = remote_entry_for_pending(pending)?;
+                    context.update_entry(entry.clone());
+                    self.cache_metadata(&path, &entry);
+                    self.update_directory_cache_for_path(&path, &entry);
+                    fill_file_info(file_info, &path, &entry);
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    self.materialize_pending(context)?;
+                }
+                Err(error) => return Err(fsp_error_from_io(error)),
+            }
+        }
         let metadata = self
             .block_on(api::resize_file(
                 &self.server_addr,
@@ -646,6 +782,17 @@ impl FileSystemContext for RemoteWinFs {
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
         if context.kind != EntryKind::File {
             return Err(FspError::IO(ErrorKind::IsADirectory));
+        }
+
+        if let Some(pending) = &context.pending
+            && !pending.is_committed()
+        {
+            match pending.read_at(buffer, offset) {
+                Ok(size) => return Ok(size as u32),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::AlreadyExists) => {}
+                Err(error) => return Err(fsp_error_from_io(error)),
+            }
         }
 
         let path = context.path();
@@ -676,6 +823,34 @@ impl FileSystemContext for RemoteWinFs {
         }
 
         let path = context.path();
+        if let Some(pending) = &context.pending
+            && !pending.is_committed()
+        {
+            let local_offset = if write_to_eof {
+                pending.metadata().map_err(fsp_error_from_io)?.size
+            } else {
+                offset
+            };
+            match pending.write_at(buffer, local_offset) {
+                Ok(()) => {
+                    let entry = remote_entry_for_pending(pending)?;
+                    context.update_entry(entry.clone());
+                    self.cache_metadata(&path, &entry);
+                    self.update_directory_cache_for_path(&path, &entry);
+                    fill_file_info(file_info, &path, &entry);
+                    return Ok(buffer.len() as u32);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    self.materialize_pending(context)?;
+                }
+                Err(error) => return Err(fsp_error_from_io(error)),
+            }
+        }
         let offset = if write_to_eof {
             let metadata = self
                 .block_on(api::get_metadata(&self.server_addr, Self::api_path(&path)))
@@ -719,6 +894,32 @@ fn fsp_error_from_api(error: &reqwest::Error) -> FspError {
         Some(404) => FspError::IO(ErrorKind::NotFound),
         Some(409) => FspError::IO(ErrorKind::AlreadyExists),
         _ => FspError::NTSTATUS(STATUS_UNEXPECTED_IO_ERROR),
+    }
+}
+
+fn remote_entry_for_pending(pending: &PendingFile) -> Result<RemoteEntry> {
+    if let Some(metadata) = pending.committed_metadata() {
+        return Ok(RemoteEntry::from_metadata(&metadata));
+    }
+    match RemoteEntry::from_pending(pending) {
+        Ok(entry) => Ok(entry),
+        Err(error) => pending
+            .committed_metadata()
+            .map(|metadata| RemoteEntry::from_metadata(&metadata))
+            .ok_or_else(|| fsp_error_from_io(error)),
+    }
+}
+
+fn fsp_error_from_io(error: std::io::Error) -> FspError {
+    match error.kind() {
+        ErrorKind::NotFound => FspError::IO(ErrorKind::NotFound),
+        ErrorKind::AlreadyExists => FspError::IO(ErrorKind::AlreadyExists),
+        ErrorKind::PermissionDenied => FspError::IO(ErrorKind::PermissionDenied),
+        ErrorKind::InvalidInput => FspError::IO(ErrorKind::InvalidInput),
+        _ => {
+            log::error!("Local write journal error: {error}");
+            FspError::NTSTATUS(STATUS_UNEXPECTED_IO_ERROR)
+        }
     }
 }
 

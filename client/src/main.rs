@@ -5,6 +5,8 @@ mod cache;
 mod fuse;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod writeback;
 
 #[cfg(not(windows))]
 use fuser::MountOption;

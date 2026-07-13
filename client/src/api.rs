@@ -4,9 +4,61 @@ use std::{
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(windows)]
+use std::{io, path::Path};
+#[cfg(windows)]
+use tokio::io::AsyncReadExt;
+#[cfg(windows)]
+use tokio_util::io::ReaderStream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(windows)]
+const COMPARE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum UploadError {
+    Io(io::Error),
+    Http(reqwest::Error),
+}
+
+#[cfg(windows)]
+impl UploadError {
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            UploadError::Io(_) => None,
+            UploadError::Http(error) => error.status(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UploadError::Io(error) => error.fmt(formatter),
+            UploadError::Http(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for UploadError {}
+
+#[cfg(windows)]
+impl From<io::Error> for UploadError {
+    fn from(error: io::Error) -> Self {
+        UploadError::Io(error)
+    }
+}
+
+#[cfg(windows)]
+impl From<reqwest::Error> for UploadError {
+    fn from(error: reqwest::Error) -> Self {
+        UploadError::Http(error)
+    }
+}
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
@@ -199,6 +251,7 @@ pub async fn create_directory(
 }
 
 // Sends an empty file to the server
+#[cfg(not(windows))]
 pub async fn create_file(
     base_url: &str,
     path: &str,
@@ -217,6 +270,60 @@ pub async fn create_file(
         .await?;
 
     response.error_for_status()?.json::<RemoteMetadata>().await
+}
+
+#[cfg(windows)]
+pub async fn conditionally_create_file_from_path(
+    base_url: &str,
+    path: &str,
+    data_path: &Path,
+    mode: u32,
+    modified_at: SystemTime,
+) -> Result<RemoteMetadata, UploadError> {
+    let request_url = endpoint_url(base_url, "files", path);
+    let file = tokio::fs::File::open(data_path).await?;
+    let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+    let request = authenticated(http_client().put(&request_url))
+        .header("If-None-Match", "*")
+        .body(body);
+    let response =
+        add_optional_metadata_headers(request, Some(mode), None, None, Some(modified_at))
+            .send()
+            .await?;
+
+    Ok(response
+        .error_for_status()?
+        .json::<RemoteMetadata>()
+        .await?)
+}
+
+#[cfg(windows)]
+pub async fn remote_file_matches_local(
+    base_url: &str,
+    path: &str,
+    data_path: &Path,
+) -> Result<bool, UploadError> {
+    let local_size = tokio::fs::metadata(data_path).await?.len();
+    let remote = get_metadata(base_url, path).await?;
+    if remote.type_ != "file" || remote.size != local_size {
+        return Ok(false);
+    }
+
+    let mut local = tokio::fs::File::open(data_path).await?;
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; COMPARE_BUFFER_SIZE];
+    while offset < local_size {
+        let requested = usize::try_from((local_size - offset).min(COMPARE_BUFFER_SIZE as u64))
+            .expect("comparison chunk always fits usize");
+        local.read_exact(&mut buffer[..requested]).await?;
+        let remote_bytes = read_file(base_url, path, offset, requested as u32).await?;
+        if remote_bytes != buffer[..requested] {
+            return Ok(false);
+        }
+        offset += requested as u64;
+    }
+
+    Ok(true)
 }
 
 // Sends a chunk of bytes to the server at a specific offset

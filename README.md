@@ -46,6 +46,19 @@ The server can be implemented using any language or framework, but should be RES
 - Optional local caching layer for performance
 - Configurable cache invalidation strategy (e.g., TTL or LRU)
 
+### Windows durable write journal
+
+New Windows files are written to a durable local journal before WinFSP reports a successful write. A bounded background uploader then sends the complete file through the normal `PUT /files/path` endpoint using standard `If-None-Match: *` create-only semantics. The server streams the upload into a transaction file, flushes it to durable storage, and atomically commits it without overwriting a conflicting remote path.
+
+This is not a tiny-file-specific server API. It applies to newly created files of any size and has two separate timing boundaries:
+
+- **Local completion:** the data has been flushed to the client journal and can be recovered after a client crash or restart.
+- **Server durability:** the server has flushed and atomically committed the file, after which the journal entry is removed.
+
+If an upload fails, the journal is retained and retried when the client restarts. If the remote path exists with different contents, the client retains the journal and logs a conflict instead of silently overwriting either version. `REMOTE_FS_UPLOAD_CONCURRENCY` controls the bounded uploader concurrency and defaults to `8`.
+
+The default Windows journal location is `%LOCALAPPDATA%\remote-fs\journal\server-HASH`. Set `REMOTE_FS_JOURNAL_DIR` before mounting to choose a different durable base directory. Do not place it on a temporary/RAM disk. Overwriting or shrinking a pending file uses a copy-on-write generation and can temporarily require approximately twice that file's local disk space; sequential growth stays in place. The guarantee assumes at least one journal/server disk remains readable; no software can preserve data after simultaneous physical loss of every copy.
+
 ## Non-Functional Requirements
 
 ### Platform Support
@@ -178,3 +191,72 @@ Run the local FUSE smoke test (it automatically starts client and server) with:
 ```
 
 It will run some commands to test if they work. If some error pops up, it will be printed. Otherwise, we will just see "FUSE smoke test passed"
+
+### Cross-platform E2E stress test
+
+[`scripts/e2e_stress.py`](scripts/e2e_stress.py) requires Python 3 but uses only its standard library. It runs the same mounted-filesystem test suite regardless of which operating system is the client or server. It verifies both mounted reads and server-side durability through the HTTP API, using SHA-256 for every payload. The suite covers empty and boundary-sized files, 200 tiny files, Unicode and URL-reserved names, overwrite/append/truncate, randomized writes, rename replacement, invalid non-empty directory deletion, concurrent files, a configurable large file, and an optional sparse file.
+
+Start the server and mount the client before running it. Windows client with macOS server:
+
+```powershell
+$env:REMOTE_FS_TOKEN = "replace-with-your-token"
+python .\scripts\e2e_stress.py run `
+  --mount R: `
+  --server-url http://192.168.1.19:3000 `
+  --large-mib 256
+```
+
+macOS/Linux client with a Windows server uses the same script and arguments, only with a Unix mount path and the Windows server IP:
+
+```sh
+export REMOTE_FS_TOKEN="replace-with-your-token"
+python3 ./scripts/e2e_stress.py run \
+  --mount ./test_folder \
+  --server-url http://WINDOWS_SERVER_IP:3000 \
+  --large-mib 256
+```
+
+Use `--sparse-mib 1024` for a full 1 GiB sparse-file transfer test. Every run creates a unique isolated server directory and removes it after success. Add `--keep` to retain a successful run. Failed runs are retained for diagnosis unless `--cleanup-on-failure` is explicitly supplied.
+
+#### Forced client-crash recovery test (Windows journal)
+
+This deliberately leaves journal entries pending, kills the client, and verifies that the next client process replays every byte. First mount the Windows client with uploads paused:
+
+```powershell
+$env:REMOTE_FS_TOKEN = "replace-with-your-token"
+$env:REMOTE_FS_UPLOAD_PAUSED = "1"
+cargo run -p client -- R: http://192.168.1.19:3000
+```
+
+In another PowerShell terminal, create and hash the recovery payloads:
+
+```powershell
+$env:REMOTE_FS_TOKEN = "replace-with-your-token"
+python .\scripts\e2e_stress.py prepare-recovery `
+  --mount R: `
+  --server-url http://192.168.1.19:3000 `
+  --state-file .\remote-fs-recovery-state.json
+```
+
+By default this prepares 32 small files plus one 16 MiB multi-chunk file. Use
+`--recovery-count` and `--recovery-large-mib` to make the crash workload larger,
+or `--recovery-large-mib 0` to omit the large file.
+
+Force-kill that client process, remove `REMOTE_FS_UPLOAD_PAUSED`, and remount normally:
+
+```powershell
+Stop-Process -Name client -Force
+Remove-Item Env:REMOTE_FS_UPLOAD_PAUSED
+cargo run -p client -- R: http://192.168.1.19:3000
+```
+
+Finally, verify that the restarted client replayed every journal entry and that the mounted and server hashes match:
+
+```powershell
+python .\scripts\e2e_stress.py verify-recovery `
+  --mount R: `
+  --server-url http://192.168.1.19:3000 `
+  --state-file .\remote-fs-recovery-state.json
+```
+
+`REMOTE_FS_UPLOAD_PAUSED` exists only for this crash-recovery test; never enable it for normal use. The normal E2E suite is client/server platform-independent. The forced-crash phase currently targets the Windows write journal and should be extended to FUSE when the same write-behind mechanism is enabled there.
